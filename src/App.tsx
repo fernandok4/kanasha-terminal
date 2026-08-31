@@ -616,7 +616,7 @@ function App() {
   return (
     <main className="app-shell">
       <aside className="areas-sidebar" aria-label="Áreas de trabalho">
-        <div className="brand"><span className="brand-mark" aria-hidden="true">⌘</span><div><strong>KanashaTerminal</strong><small>Terminais locais, sem nuvem</small></div></div>
+        <div className="brand"><span className="brand-mark" aria-hidden="true">KT</span><div><strong>KanashaTerminal</strong><small>Terminais locais, sem nuvem</small></div></div>
         <div className="sidebar-heading"><span>Áreas de trabalho</span><button title="Criar nova área" aria-label="Criar nova área" onClick={() => setAreaDialogOpen(true)}>+</button></div>
         <nav className="area-list">
           {snapshot.areas.map((area) => (
