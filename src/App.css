@@ -112,6 +112,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .path-field { display: flex; gap: 8px; }
 .path-field button, .modal footer button { border: 1px solid #475569; border-radius: 7px; padding: 8px 11px; background: #243250; color: #f8fafc; }
 .modal p { margin: 2px 0 6px; color: #94a3b8; font-size: 12px; line-height: 1.45; }
+.modal .form-error { color: #fecaca; }
 .modal footer { justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
 @media (max-width: 760px) {

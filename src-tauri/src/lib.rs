@@ -1065,4 +1065,92 @@ mod tests {
         assert!(saved.contains("\"ratio\": 0.7"));
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
     }
+
+    #[test]
+    fn edited_names_and_terminal_labels_are_validated_and_persisted() {
+        let path = state_path();
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let state = AppState::load(path.clone()).expect("state");
+        let created = state
+            .create_area(CreateAreaInput {
+                name: "Área inicial".into(),
+                root_path: root,
+            })
+            .expect("area");
+        let area_id = created.areas[0].id.clone();
+        let workspace_id = created.areas[0].workspaces[0].id.clone();
+        let terminal = state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: workspace_id.clone(),
+                profile_id: SHELL.into(),
+                title: Some("Terminal inicial".into()),
+                target_panel_id: None,
+                direction: None,
+            })
+            .expect("terminal");
+        let terminal_id = terminal.areas[0].workspaces[0].panels[0].id.clone();
+
+        assert!(state.rename_area(&area_id, "   ").is_err());
+        assert!(state.rename_workspace(&workspace_id, "\0").is_err());
+        assert!(state.rename_terminal(&terminal_id, "\n").is_err());
+        assert!(state
+            .set_terminal_label(SetTerminalLabelInput {
+                terminal_id: terminal_id.clone(),
+                label: Some("duas\nlinhas".into()),
+            })
+            .is_err());
+
+        state
+            .rename_area(&area_id, "Plataforma")
+            .expect("rename area");
+        state
+            .rename_workspace(&workspace_id, "Revisão")
+            .expect("rename workspace");
+        state
+            .rename_terminal(&terminal_id, "Codex")
+            .expect("rename terminal");
+        let labeled = state
+            .set_terminal_label(SetTerminalLabelInput {
+                terminal_id: terminal_id.clone(),
+                label: Some("backend".into()),
+            })
+            .expect("set label");
+        assert_eq!(labeled.areas[0].name, "Plataforma");
+        assert_eq!(labeled.areas[0].workspaces[0].name, "Revisão");
+        assert_eq!(labeled.areas[0].workspaces[0].panels[0].title, "Codex");
+        assert_eq!(
+            labeled.areas[0].workspaces[0].panels[0].label.as_deref(),
+            Some("backend")
+        );
+        drop(state);
+
+        let restored_state = AppState::load(path.clone()).expect("restored state");
+        let restored = restored_state.snapshot().expect("restored snapshot");
+        assert_eq!(restored.areas[0].name, "Plataforma");
+        assert_eq!(restored.areas[0].workspaces[0].name, "Revisão");
+        assert_eq!(restored.areas[0].workspaces[0].panels[0].title, "Codex");
+        assert_eq!(
+            restored.areas[0].workspaces[0].panels[0].label.as_deref(),
+            Some("backend")
+        );
+        assert!(restored.active_terminal_ids.is_empty());
+
+        let cleared = restored_state
+            .set_terminal_label(SetTerminalLabelInput {
+                terminal_id,
+                label: None,
+            })
+            .expect("clear label");
+        assert_eq!(cleared.areas[0].workspaces[0].panels[0].label, None);
+        drop(restored_state);
+
+        let saved = fs::read_to_string(&path).expect("saved state");
+        assert!(saved.contains("Plataforma"));
+        assert!(saved.contains("Revisão"));
+        assert!(saved.contains("Codex"));
+        assert!(!saved.contains("\"label\""));
+        assert!(!saved.contains("activeTerminalIds"));
+        assert!(!saved.contains("sessions"));
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
 }

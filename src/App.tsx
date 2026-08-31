@@ -17,6 +17,12 @@ import "./App.css";
 
 type MenuEntry = { label: string; description: string; action: () => void };
 type ContextMenuState = { x: number; y: number; entries: MenuEntry[] } | null;
+type TextDialogState =
+  | { kind: "create-workspace"; areaId: string }
+  | { kind: "rename-area"; areaId: string }
+  | { kind: "rename-workspace"; workspaceId: string }
+  | { kind: "rename-terminal"; terminalId: string }
+  | { kind: "terminal-label"; terminalId: string };
 
 const MIN_SPLIT_RATIO = 0.15;
 const MAX_SPLIT_RATIO = 0.85;
@@ -55,6 +61,9 @@ function App() {
   const [profileExecutable, setProfileExecutable] = useState("");
   const [profileArguments, setProfileArguments] = useState("");
   const [configuredProfileId, setConfiguredProfileId] = useState<string | null>(null);
+  const [textDialog, setTextDialog] = useState<TextDialogState | null>(null);
+  const [textDialogValue, setTextDialogValue] = useState("");
+  const [textDialogError, setTextDialogError] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null);
   const [maximizedPanelId, setMaximizedPanelId] = useState<string | null>(null);
@@ -172,19 +181,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!areaDialogOpen && !profileDialogOpen) return;
+    if (!areaDialogOpen && !profileDialogOpen && !textDialog) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setAreaDialogOpen(false);
-      setProfileDialogOpen(false);
-      setConfiguredProfileId(null);
-      setProfileName("");
-      setProfileExecutable("");
-      setProfileArguments("");
+      closeProfileDialog();
+      closeTextDialog();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [areaDialogOpen, profileDialogOpen]);
+  }, [areaDialogOpen, profileDialogOpen, textDialog]);
 
   async function refresh() {
     try {
@@ -238,10 +244,66 @@ function App() {
     setAreaPath("");
   }
 
-  async function createWorkspace() {
+  function openCreateWorkspaceDialog() {
     if (!selectedArea) return;
-    const name = window.prompt("Nome do novo workspace", "Workspace novo");
-    if (name?.trim()) await run(terminalApi.createWorkspace({ areaId: selectedArea.id, name }));
+    openTextDialog({ kind: "create-workspace", areaId: selectedArea.id }, "Workspace novo");
+  }
+
+  function openTextDialog(dialog: TextDialogState, value: string) {
+    setTextDialog(dialog);
+    setTextDialogValue(value);
+    setTextDialogError(null);
+  }
+
+  function closeTextDialog() {
+    setTextDialog(null);
+    setTextDialogValue("");
+    setTextDialogError(null);
+  }
+
+  async function saveTextDialog(event: React.FormEvent) {
+    event.preventDefault();
+    if (!textDialog) return;
+
+    const value = textDialogValue.trim();
+    const isLabel = textDialog.kind === "terminal-label";
+    if (!isLabel && !value) {
+      setTextDialogError("Informe um nome para continuar.");
+      return;
+    }
+    if (value.includes("\0") || (!isLabel && value.length > 120)) {
+      setTextDialogError("Informe um nome válido com até 120 caracteres.");
+      return;
+    }
+    if (isLabel && (value.includes("\r") || value.includes("\n") || value.length > 32)) {
+      setTextDialogError("Informe uma etiqueta com até 32 caracteres em uma linha.");
+      return;
+    }
+
+    try {
+      let next: AppSnapshot;
+      switch (textDialog.kind) {
+        case "create-workspace":
+          next = await terminalApi.createWorkspace({ areaId: textDialog.areaId, name: value });
+          break;
+        case "rename-area":
+          next = await terminalApi.renameArea(textDialog.areaId, value);
+          break;
+        case "rename-workspace":
+          next = await terminalApi.renameWorkspace(textDialog.workspaceId, value);
+          break;
+        case "rename-terminal":
+          next = await terminalApi.renameTerminal(textDialog.terminalId, value);
+          break;
+        case "terminal-label":
+          next = await terminalApi.setTerminalLabel(textDialog.terminalId, value || null);
+          break;
+      }
+      applySnapshot(next);
+      closeTextDialog();
+    } catch (actionError) {
+      setTextDialogError(errorMessage(actionError));
+    }
   }
 
   function focusAdjacentPanel(offset: -1 | 1) {
@@ -333,7 +395,7 @@ function App() {
       const editingText =
         target instanceof Element &&
         Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
-      if ((areaDialogOpen || profileDialogOpen) || (editingText && !terminalHasFocus)) return;
+      if ((areaDialogOpen || profileDialogOpen || textDialog) || (editingText && !terminalHasFocus)) return;
       if (
         event.altKey &&
         ["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(event.key)
@@ -354,7 +416,7 @@ function App() {
         setAreaDialogOpen(true);
       } else if (event.shiftKey && event.key.toLowerCase() === "w") {
         event.preventDefault();
-        void createWorkspace();
+        openCreateWorkspaceDialog();
       } else if (event.key === ",") {
         event.preventDefault();
         openNewProfileDialog();
@@ -368,7 +430,7 @@ function App() {
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [selectedWorkspace, selectedArea, selectedProfileId, areaDialogOpen, profileDialogOpen, focusedPanelId, visiblePanelIds]);
+  }, [selectedWorkspace, selectedArea, selectedProfileId, areaDialogOpen, profileDialogOpen, textDialog, focusedPanelId, visiblePanelIds]);
 
   async function stopAndRemoveTerminal(terminalId: string) {
     const isActive = activeIds.has(terminalId);
@@ -449,10 +511,7 @@ function App() {
       {
         label: "Renomear área",
         description: "Altera apenas o nome exibido no KanashaTerminal.",
-        action: async () => {
-          const next = window.prompt("Novo nome da área", area.name);
-          if (next?.trim()) await run(terminalApi.renameArea(area.id, next));
-        },
+        action: () => openTextDialog({ kind: "rename-area", areaId: area.id }, area.name),
       },
       {
         label: "Alterar pasta-raiz",
@@ -494,21 +553,12 @@ function App() {
       {
         label: "Renomear terminal",
         description: "Define o nome exibido deste painel, sem alterar o processo.",
-        action: async () => {
-          const next = window.prompt("Nome do terminal", terminal.title);
-          if (next?.trim()) await run(terminalApi.renameTerminal(terminalId, next));
-        },
+        action: () => openTextDialog({ kind: "rename-terminal", terminalId }, terminal.title),
       },
       {
         label: terminal.label ? "Alterar etiqueta" : "Definir etiqueta",
         description: "Exibe uma marca curta para identificar este terminal mais rapidamente.",
-        action: async () => {
-          const next = window.prompt(
-            "Etiqueta curta (deixe vazio para remover)",
-            terminal.label ?? "",
-          );
-          if (next !== null) await run(terminalApi.setTerminalLabel(terminalId, next));
-        },
+        action: () => openTextDialog({ kind: "terminal-label", terminalId }, terminal.label ?? ""),
       },
       {
         label: activeIds.has(terminalId) ? "Encerrar processo" : "Iniciar terminal",
@@ -524,6 +574,40 @@ function App() {
       { label: "Dividir à direita", description: "Cria um painel ao lado usando o perfil selecionado.", action: () => void addTerminal(terminalId, "vertical") },
       { label: "Dividir abaixo", description: "Cria um painel abaixo usando o perfil selecionado.", action: () => void addTerminal(terminalId, "horizontal") },
       { label: "Fechar painel", description: "Remove o painel e pede confirmação se o processo estiver ativo.", action: () => void stopAndRemoveTerminal(terminalId) },
+    ];
+  }
+
+  function workspaceMenu(workspace: Workspace): MenuEntry[] {
+    return [
+      {
+        label: "Renomear",
+        description: "Altera somente o nome desta tela.",
+        action: () => openTextDialog({ kind: "rename-workspace", workspaceId: workspace.id }, workspace.name),
+      },
+      {
+        label: "Duplicar",
+        description: "Duplica a estrutura de painéis sem copiar processos.",
+        action: () => void run(terminalApi.duplicateWorkspace(workspace.id)),
+      },
+      {
+        label: "Mover para esquerda",
+        description: "Reordena a aba deste workspace.",
+        action: () => {
+          if (selectedArea) void run(terminalApi.moveWorkspace(selectedArea.id, workspace.id, "earlier"));
+        },
+      },
+      {
+        label: "Mover para direita",
+        description: "Reordena a aba deste workspace.",
+        action: () => {
+          if (selectedArea) void run(terminalApi.moveWorkspace(selectedArea.id, workspace.id, "later"));
+        },
+      },
+      {
+        label: "Fechar workspace",
+        description: "Remove a configuração e pede confirmação se houver processo ativo.",
+        action: () => void stopThenRemoveWorkspace(workspace),
+      },
     ];
   }
 
@@ -564,11 +648,11 @@ function App() {
             <div className="tabs" role="tablist" aria-label={`Workspaces de ${selectedArea.name}`}>
               {selectedArea.workspaces.map((workspace) => (
                 <div className="tab-group" key={workspace.id}>
-                  <button role="tab" aria-selected={workspace.id === selectedWorkspace?.id} className={workspace.id === selectedWorkspace?.id ? "tab selected" : "tab"} title={`Selecionar workspace ${workspace.name}`} onClick={() => setSelectedWorkspaceId(workspace.id)} onContextMenu={(event) => showMenu(event, workspaceMenu(workspace, selectedArea, run, stopThenRemoveWorkspace))}>{workspace.name}</button>
-                  <button className="context-trigger tab-context-trigger" title={`Ações do workspace ${workspace.name}`} aria-label={`Ações do workspace ${workspace.name}`} aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, workspaceMenu(workspace, selectedArea, run, stopThenRemoveWorkspace))}>⋯</button>
+                  <button role="tab" aria-selected={workspace.id === selectedWorkspace?.id} className={workspace.id === selectedWorkspace?.id ? "tab selected" : "tab"} title={`Selecionar workspace ${workspace.name}`} onClick={() => setSelectedWorkspaceId(workspace.id)} onContextMenu={(event) => showMenu(event, workspaceMenu(workspace))}>{workspace.name}</button>
+                  <button className="context-trigger tab-context-trigger" title={`Ações do workspace ${workspace.name}`} aria-label={`Ações do workspace ${workspace.name}`} aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, workspaceMenu(workspace))}>⋯</button>
                 </div>
               ))}
-              <button className="tab add-tab" title="Criar novo workspace" aria-label="Criar novo workspace" onClick={() => void createWorkspace()}>+</button>
+              <button className="tab add-tab" title="Criar novo workspace" aria-label="Criar novo workspace" onClick={openCreateWorkspaceDialog}>+</button>
             </div>
           </header>
           {selectedWorkspace ? <>
@@ -589,18 +673,9 @@ function App() {
       {contextMenu ? <ContextMenu menu={contextMenu} onClose={() => setContextMenu(null)} /> : null}
       {areaDialogOpen ? <AreaDialog name={areaName} path={areaPath} onName={setAreaName} onPath={setAreaPath} onChoose={() => void chooseFolder(setAreaPath)} onClose={() => setAreaDialogOpen(false)} onSubmit={createArea} /> : null}
       {profileDialogOpen ? <ProfileDialog editing={configuredProfileId !== null} name={profileName} executable={profileExecutable} argumentsText={profileArguments} onName={setProfileName} onExecutable={setProfileExecutable} onArguments={setProfileArguments} onClose={closeProfileDialog} onSubmit={createProfile} /> : null}
+      {textDialog ? <TextEditDialog dialog={textDialog} value={textDialogValue} error={textDialogError} onValue={setTextDialogValue} onClose={closeTextDialog} onSubmit={saveTextDialog} /> : null}
     </main>
   );
-}
-
-function workspaceMenu(workspace: Workspace, area: Area, run: (action: Promise<AppSnapshot>) => Promise<void>, remove: (workspace: Workspace) => Promise<void>): MenuEntry[] {
-  return [
-    { label: "Renomear", description: "Altera somente o nome desta tela.", action: async () => { const next = window.prompt("Novo nome do workspace", workspace.name); if (next?.trim()) await run(terminalApi.renameWorkspace(workspace.id, next)); } },
-    { label: "Duplicar", description: "Duplica a estrutura de painéis sem copiar processos.", action: () => void run(terminalApi.duplicateWorkspace(workspace.id)) },
-    { label: "Mover para esquerda", description: "Reordena a aba deste workspace.", action: () => void run(terminalApi.moveWorkspace(area.id, workspace.id, "earlier")) },
-    { label: "Mover para direita", description: "Reordena a aba deste workspace.", action: () => void run(terminalApi.moveWorkspace(area.id, workspace.id, "later")) },
-    { label: "Fechar workspace", description: "Remove a configuração e pede confirmação se houver processo ativo.", action: () => void remove(workspace) },
-  ];
 }
 
 type LayoutTreeProps = {
@@ -696,6 +771,63 @@ function SplitDivider({ splitId, direction, ratio, onChange, onCommit }: { split
 
 function ContextMenu({ menu, onClose }: { menu: NonNullable<ContextMenuState>; onClose: () => void }) {
   return <div className="context-menu" role="menu" style={{ left: menu.x, top: menu.y }} onClick={(event) => event.stopPropagation()}>{menu.entries.map((entry) => <button role="menuitem" key={entry.label} title={entry.description} onClick={() => { onClose(); entry.action(); }}><strong>{entry.label}</strong><small>{entry.description}</small></button>)}</div>;
+}
+
+function TextEditDialog({ dialog, value, error, onValue, onClose, onSubmit }: { dialog: TextDialogState; value: string; error: string | null; onValue: (value: string) => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
+  const dialogRef = useRef<HTMLFormElement>(null);
+  const isLabel = dialog.kind === "terminal-label";
+  const copy = isLabel
+    ? {
+        title: "Etiqueta do terminal",
+        field: "Etiqueta",
+        submit: "Salvar etiqueta",
+        hint: "Use uma marca curta para identificar o painel. Deixe em branco para remover a etiqueta.",
+      }
+    : dialog.kind === "create-workspace"
+      ? {
+          title: "Novo workspace",
+          field: "Nome do workspace",
+          submit: "Criar workspace",
+          hint: "O workspace organiza os painéis desta Área e não altera arquivos da pasta.",
+        }
+      : {
+          title: dialog.kind === "rename-area" ? "Renomear área de trabalho" : dialog.kind === "rename-workspace" ? "Renomear workspace" : "Renomear terminal",
+          field: "Nome",
+          submit: "Salvar nome",
+          hint: "Esta alteração atualiza apenas o nome exibido no KanashaTerminal.",
+        };
+
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialogElement = dialogRef.current;
+    const focusable = () => Array.from(
+      dialogElement?.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])",
+      ) ?? [],
+    );
+    dialogElement?.querySelector<HTMLInputElement>("input")?.focus();
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const elements = focusable();
+      if (elements.length === 0) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", trapFocus);
+    return () => {
+      document.removeEventListener("keydown", trapFocus);
+      previousFocus?.focus();
+    };
+  }, []);
+
+  return <div className="modal-backdrop"><form ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="text-edit-dialog-title" onSubmit={onSubmit}><header><h2 id="text-edit-dialog-title">{copy.title}</h2><button type="button" title="Fechar" aria-label="Fechar" onClick={onClose}>×</button></header><label htmlFor="text-edit-dialog-value">{copy.field}</label><input id="text-edit-dialog-value" required={!isLabel} maxLength={isLabel ? 32 : 120} value={value} onChange={(event) => onValue(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? "text-edit-dialog-hint text-edit-dialog-error" : "text-edit-dialog-hint"} autoFocus /><p id="text-edit-dialog-hint">{copy.hint}</p>{error ? <p className="form-error" id="text-edit-dialog-error" role="alert">{error}</p> : null}<footer><button type="button" title="Cancelar edição" onClick={onClose}>Cancelar</button><button type="submit" title={copy.submit} disabled={!isLabel && !value.trim()}>{copy.submit}</button></footer></form></div>;
 }
 
 function AreaDialog({ name, path, onName, onPath, onChoose, onClose, onSubmit }: { name: string; path: string; onName: (value: string) => void; onPath: (value: string) => void; onChoose: () => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {

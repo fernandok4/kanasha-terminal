@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import type { AppSnapshot } from "./types";
 
 const { invoke, appWindow } = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -14,7 +15,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => appWindow,
 }));
 vi.mock("./components/TerminalPanel", () => ({
-  TerminalPanel: ({ panel, focused, onFocus, onContextMenu }: { panel: { id: string; title: string }; focused: boolean; onFocus: (id: string) => void; onContextMenu: (event: React.MouseEvent, id: string) => void }) => <button data-testid={`terminal-panel-${panel.id}`} data-focused={focused} onClick={() => onFocus(panel.id)} onContextMenu={(event) => onContextMenu(event, panel.id)}>{panel.title}</button>,
+  TerminalPanel: ({ panel, focused, onFocus, onContextMenu }: { panel: { id: string; title: string; label?: string | null }; focused: boolean; onFocus: (id: string) => void; onContextMenu: (event: React.MouseEvent, id: string) => void }) => <button data-testid={`terminal-panel-${panel.id}`} data-focused={focused} data-label={panel.label ?? ""} onClick={() => onFocus(panel.id)} onContextMenu={(event) => onContextMenu(event, panel.id)}>{panel.title}</button>,
 }));
 
 describe("KanashaTerminal", () => {
@@ -235,8 +236,52 @@ describe("KanashaTerminal", () => {
     await waitFor(() => expect(second).toHaveAttribute("data-focused", "true"));
   });
 
-  it("salva uma etiqueta curta pelo menu contextual do painel", async () => {
+  it("cria um workspace pelo diálogo interno", async () => {
     const initial = {
+      areas: [
+        {
+          id: "area-1",
+          name: "Área",
+          rootPath: "/tmp",
+          workspaces: [{ id: "workspace-1", name: "Workspace 1", panels: [], layout: null }],
+        },
+      ],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: [],
+    };
+    const created = {
+      ...initial,
+      areas: [{
+        ...initial.areas[0],
+        workspaces: [
+          ...initial.areas[0].workspaces,
+          { id: "workspace-2", name: "Observabilidade", panels: [], layout: null },
+        ],
+      }],
+    };
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") return Promise.resolve(initial);
+      if (command === "create_workspace") return Promise.resolve(created);
+      return Promise.reject(new Error(`Comando inesperado: ${command}`));
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Criar novo workspace" }));
+
+    expect(screen.getByRole("dialog", { name: "Novo workspace" })).toBeInTheDocument();
+    const name = screen.getByLabelText("Nome do workspace");
+    expect(name).toHaveValue("Workspace novo");
+    fireEvent.change(name, { target: { value: "Observabilidade" } });
+    fireEvent.click(screen.getByRole("button", { name: "Criar workspace" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("create_workspace", {
+      input: { areaId: "area-1", name: "Observabilidade" },
+    }));
+    expect(screen.queryByRole("dialog", { name: "Novo workspace" })).not.toBeInTheDocument();
+  });
+
+  it("edita nomes de área, workspace e terminal pelos diálogos internos", async () => {
+    let current: AppSnapshot = {
       areas: [
         {
           id: "area-1",
@@ -248,20 +293,177 @@ describe("KanashaTerminal", () => {
       profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
       activeTerminalIds: [],
     };
-    invoke.mockImplementation((command: string) => {
-      if (command === "get_snapshot" || command === "set_terminal_label") return Promise.resolve(initial);
+    invoke.mockImplementation((command: string, input?: Record<string, string>) => {
+      if (command === "get_snapshot") return Promise.resolve(current);
+      if (command === "rename_area") {
+        current = { ...current, areas: [{ ...current.areas[0], name: input?.name ?? "" }] };
+      }
+      if (command === "rename_workspace") {
+        current = {
+          ...current,
+          areas: [{
+            ...current.areas[0],
+            workspaces: [{ ...current.areas[0].workspaces[0], name: input?.name ?? "" }],
+          }],
+        };
+      }
+      if (command === "rename_terminal") {
+        current = {
+          ...current,
+          areas: [{
+            ...current.areas[0],
+            workspaces: [{
+              ...current.areas[0].workspaces[0],
+              panels: [{ ...current.areas[0].workspaces[0].panels[0], title: input?.name ?? "" }],
+            }],
+          }],
+        };
+      }
+      if (["rename_area", "rename_workspace", "rename_terminal"].includes(command)) {
+        return Promise.resolve(current);
+      }
       return Promise.reject(new Error(`Comando inesperado: ${command}`));
     });
-    const prompt = vi.spyOn(window, "prompt").mockReturnValue("backend");
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Ações da área Área" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Renomear área/ }));
+    fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "Plataforma" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar nome" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("rename_area", {
+      areaId: "area-1", name: "Plataforma",
+    }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Ações do workspace Workspace 1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Renomear/ }));
+    expect(screen.getByRole("dialog", { name: "Renomear workspace" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "Revisão" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar nome" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("rename_workspace", {
+      workspaceId: "workspace-1", name: "Revisão",
+    }));
+
+    fireEvent.contextMenu(await screen.findByTestId("terminal-panel-panel-1"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Renomear terminal/ }));
+    expect(screen.getByRole("dialog", { name: "Renomear terminal" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "Codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar nome" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("rename_terminal", {
+      terminalId: "panel-1", name: "Codex",
+    }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plataforma" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Revisão" })).toBeInTheDocument();
+      expect(screen.getByTestId("terminal-panel-panel-1")).toHaveTextContent("Codex");
+    });
+    cleanup();
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Plataforma" })).toBeInTheDocument();
+    expect(await screen.findByRole("tab", { name: "Revisão" })).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-panel-panel-1")).toHaveTextContent("Codex");
+  });
+
+  it("define, altera e remove a etiqueta pelo diálogo interno", async () => {
+    let current: AppSnapshot = {
+      areas: [
+        {
+          id: "area-1",
+          name: "Área",
+          rootPath: "/tmp",
+          workspaces: [{ id: "workspace-1", name: "Workspace 1", panels: [{ id: "panel-1", title: "Shell", profileId: "shell" }], layout: { kind: "panel", panelId: "panel-1" } }],
+        },
+      ],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: [],
+    };
+    invoke.mockImplementation((command: string, input?: { input?: { label: string | null } }) => {
+      if (command === "get_snapshot") return Promise.resolve(current);
+      if (command === "set_terminal_label") {
+        current = {
+          ...current,
+          areas: [{
+            ...current.areas[0],
+            workspaces: [{
+              ...current.areas[0].workspaces[0],
+              panels: [{ ...current.areas[0].workspaces[0].panels[0], label: input?.input?.label ?? null }],
+            }],
+          }],
+        };
+        return Promise.resolve(current);
+      }
+      return Promise.reject(new Error(`Comando inesperado: ${command}`));
+    });
 
     render(<App />);
     fireEvent.contextMenu(await screen.findByTestId("terminal-panel-panel-1"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Definir etiqueta/ }));
-
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Definir etiqueta/ }));
+    const label = screen.getByLabelText("Etiqueta");
+    expect(label).toHaveFocus();
+    fireEvent.change(label, { target: { value: "backend" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar etiqueta" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_terminal_label", {
       input: { terminalId: "panel-1", label: "backend" },
     }));
-    prompt.mockRestore();
+    await waitFor(() => expect(screen.getByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", "backend"));
+    cleanup();
+    render(<App />);
+    expect(await screen.findByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", "backend");
+
+    fireEvent.contextMenu(screen.getByTestId("terminal-panel-panel-1"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Alterar etiqueta/ }));
+    expect(screen.getByLabelText("Etiqueta")).toHaveValue("backend");
+    fireEvent.change(screen.getByLabelText("Etiqueta"), { target: { value: "deploy" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar etiqueta" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_terminal_label", {
+      input: { terminalId: "panel-1", label: "deploy" },
+    }));
+    await waitFor(() => expect(screen.getByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", "deploy"));
+    cleanup();
+    render(<App />);
+    expect(await screen.findByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", "deploy");
+
+    fireEvent.contextMenu(screen.getByTestId("terminal-panel-panel-1"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Alterar etiqueta/ }));
+    expect(screen.getByLabelText("Etiqueta")).toHaveValue("deploy");
+    fireEvent.change(screen.getByLabelText("Etiqueta"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Salvar etiqueta" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_terminal_label", {
+      input: { terminalId: "panel-1", label: null },
+    }));
+    await waitFor(() => expect(screen.getByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", ""));
+    cleanup();
+    render(<App />);
+    expect(await screen.findByTestId("terminal-panel-panel-1")).toHaveAttribute("data-label", "");
+  });
+
+  it("valida nome vazio e permite cancelar sem chamar IPC de edição", async () => {
+    const initial = {
+      areas: [
+        {
+          id: "area-1",
+          name: "Área",
+          rootPath: "/tmp",
+          workspaces: [{ id: "workspace-1", name: "Workspace 1", panels: [], layout: null }],
+        },
+      ],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: [],
+    };
+    invoke.mockResolvedValue(initial);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Ações da área Área" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Renomear área/ }));
+    fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "   " } });
+    expect(screen.getByRole("button", { name: "Salvar nome" })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("dialog", { name: "Renomear área de trabalho" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Informe um nome para continuar.");
+    expect(invoke).not.toHaveBeenCalledWith("rename_area", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(screen.queryByRole("dialog", { name: "Renomear área de trabalho" })).not.toBeInTheDocument();
+    expect(invoke).not.toHaveBeenCalledWith("rename_area", expect.anything());
   });
 
   it("permite reconfigurar um perfil personalizado sem criar outro", async () => {
