@@ -78,6 +78,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .workspace-toolbar button:hover, .empty-workspace button:hover, .modal footer button:last-child:hover { background: var(--brand-peach-strong); box-shadow: 0 5px 16px rgba(217, 160, 119, 0.28); transform: translateY(-1px); }
 .privacy-note { margin-left: auto; color: var(--brand-sage-light); font-size: 10px; font-weight: 600; }
 .terminal-stage { display: flex; min-width: 0; min-height: 0; flex: 1; overflow: hidden; padding: 9px; background: radial-gradient(circle at 30% 0%, rgba(143, 168, 130, 0.07), transparent 32%), var(--canvas-deep); }
+.workspace-terminal-layout { display: flex; min-width: 0; min-height: 0; flex: 1; }
+.workspace-terminal-layout.is-hidden { display: none; }
 .terminal-split { display: grid; min-width: 0; min-height: 0; flex: 1; overflow: hidden; }
 .terminal-split.vertical { grid-template-columns: minmax(0, 1fr) 9px minmax(0, 1fr); }
 .terminal-split.horizontal { grid-template-rows: minmax(0, 1fr) 9px minmax(0, 1fr); }
