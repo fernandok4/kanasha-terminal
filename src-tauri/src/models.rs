@@ -398,6 +398,73 @@ mod tests {
     }
 
     #[test]
+    fn removing_one_of_four_panels_collapses_only_its_empty_split() {
+        let mut workspace = Workspace {
+            id: new_id(),
+            name: "Teste".to_string(),
+            panels: Vec::new(),
+            layout: None,
+        };
+
+        workspace
+            .add_panel(panel("first"), None, SplitDirection::Vertical)
+            .expect("first panel should be added");
+        workspace
+            .add_panel(panel("second"), Some("first"), SplitDirection::Horizontal)
+            .expect("second panel should split the first");
+        workspace
+            .add_panel(panel("third"), Some("second"), SplitDirection::Vertical)
+            .expect("third panel should split the second");
+        workspace
+            .add_panel(panel("fourth"), Some("third"), SplitDirection::Horizontal)
+            .expect("fourth panel should split the third");
+
+        assert!(workspace.remove_panel("fourth"));
+        assert_eq!(
+            workspace.panel_ids().collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        match workspace.layout.expect("layout should remain") {
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(
+                    *first,
+                    LayoutNode::Panel {
+                        panel_id: "first".to_string(),
+                    }
+                );
+                match *second {
+                    LayoutNode::Split {
+                        direction: SplitDirection::Vertical,
+                        first,
+                        second,
+                        ..
+                    } => {
+                        assert_eq!(
+                            *first,
+                            LayoutNode::Panel {
+                                panel_id: "second".to_string(),
+                            }
+                        );
+                        assert_eq!(
+                            *second,
+                            LayoutNode::Panel {
+                                panel_id: "third".to_string(),
+                            }
+                        );
+                    }
+                    _ => panic!("remaining nested split should remain"),
+                }
+            }
+            _ => panic!("only the empty split should be collapsed"),
+        }
+    }
+
+    #[test]
     fn duplicated_workspace_uses_new_workspace_and_panel_ids() {
         let original = Workspace {
             id: "workspace-original".to_string(),

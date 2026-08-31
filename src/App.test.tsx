@@ -15,7 +15,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => appWindow,
 }));
 vi.mock("./components/TerminalPanel", () => ({
-  TerminalPanel: ({ panel, focused, onFocus, onContextMenu }: { panel: { id: string; title: string; label?: string | null }; focused: boolean; onFocus: (id: string) => void; onContextMenu: (event: React.MouseEvent, id: string) => void }) => <button data-testid={`terminal-panel-${panel.id}`} data-focused={focused} data-label={panel.label ?? ""} onClick={() => onFocus(panel.id)} onContextMenu={(event) => onContextMenu(event, panel.id)}>{panel.title}</button>,
+  TerminalPanel: ({ panel, focused, onFocus, onClose, onContextMenu }: { panel: { id: string; title: string; label?: string | null }; focused: boolean; onFocus: (id: string) => void; onClose: (id: string) => void; onContextMenu: (event: React.MouseEvent, id: string) => void }) => <div data-testid={`terminal-panel-${panel.id}`} data-focused={focused} data-label={panel.label ?? ""} onContextMenu={(event) => onContextMenu(event, panel.id)}><button onClick={() => onFocus(panel.id)}>{panel.title}</button><button aria-label={`Fechar ${panel.title}`} onClick={() => onClose(panel.id)}>×</button></div>,
 }));
 
 describe("KanashaTerminal", () => {
@@ -234,6 +234,92 @@ describe("KanashaTerminal", () => {
     fireEvent.keyDown(window, { key: "ArrowRight", ctrlKey: true, altKey: true });
 
     await waitFor(() => expect(second).toHaveAttribute("data-focused", "true"));
+  });
+
+  it("remove um painel de quatro sem manter um ramo de split ou scroll residual", async () => {
+    let current: AppSnapshot = {
+      areas: [
+        {
+          id: "area-1",
+          name: "Área",
+          rootPath: "/tmp",
+          workspaces: [
+            {
+              id: "workspace-1",
+              name: "Workspace 1",
+              panels: ["panel-1", "panel-2", "panel-3", "panel-4"].map((id) => ({
+                id,
+                title: `Terminal ${id.slice(-1)}`,
+                profileId: "shell",
+              })),
+              layout: {
+                kind: "split",
+                id: "split-root",
+                direction: "vertical",
+                ratio: 0.5,
+                first: {
+                  kind: "split",
+                  id: "split-left",
+                  direction: "horizontal",
+                  ratio: 0.5,
+                  first: { kind: "panel", panelId: "panel-1" },
+                  second: { kind: "panel", panelId: "panel-2" },
+                },
+                second: {
+                  kind: "split",
+                  id: "split-right",
+                  direction: "horizontal",
+                  ratio: 0.5,
+                  first: { kind: "panel", panelId: "panel-3" },
+                  second: { kind: "panel", panelId: "panel-4" },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: [],
+    };
+    const afterRemoval: AppSnapshot = {
+      ...current,
+      areas: [{
+        ...current.areas[0],
+        workspaces: [{
+          ...current.areas[0].workspaces[0],
+          panels: current.areas[0].workspaces[0].panels.filter((panel) => panel.id !== "panel-4"),
+          layout: {
+            kind: "split",
+            id: "split-root",
+            direction: "vertical",
+            ratio: 0.5,
+            first: current.areas[0].workspaces[0].layout!.kind === "split"
+              ? current.areas[0].workspaces[0].layout!.first
+              : { kind: "panel", panelId: "panel-1" },
+            second: { kind: "panel", panelId: "panel-3" },
+          },
+        }],
+      }],
+    };
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") return Promise.resolve(current);
+      if (command === "remove_terminal") {
+        current = afterRemoval;
+        return Promise.resolve(current);
+      }
+      return Promise.reject(new Error(`Comando inesperado: ${command}`));
+    });
+
+    render(<App />);
+    expect(await screen.findAllByTestId(/terminal-panel-/)).toHaveLength(4);
+    expect(screen.getAllByRole("separator")).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "Fechar Terminal 4" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("remove_terminal", { terminalId: "panel-4" }));
+    expect(await screen.findAllByTestId(/terminal-panel-/)).toHaveLength(3);
+    expect(screen.queryByTestId("terminal-panel-panel-4")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("separator")).toHaveLength(2);
   });
 
   it("cria um workspace pelo diálogo interno", async () => {
