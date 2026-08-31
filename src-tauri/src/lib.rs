@@ -884,6 +884,9 @@ fn remove_custom_profile(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    let _ = fix_path_env::fix();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -926,15 +929,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn state_path() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
         std::env::temp_dir()
-            .join(format!("kanasha-terminal-{unique}"))
+            .join(format!("kanasha-terminal-test-{}", new_id()))
             .join("workspace.json")
     }
 
