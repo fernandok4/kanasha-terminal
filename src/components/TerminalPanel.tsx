@@ -1,10 +1,22 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef } from "react";
 import { terminalApi } from "../api";
 import type { TerminalExit, TerminalOutput, TerminalPanelModel } from "../types";
+
+function openExternalTerminalLink(value: string) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return;
+    void openUrl(url.href).catch(() => undefined);
+  } catch {
+    // A saída do terminal não pode abrir esquemas, caminhos ou comandos inválidos.
+  }
+}
 
 type TerminalPanelProps = {
   panel: TerminalPanelModel;
@@ -73,7 +85,13 @@ export function TerminalPanel({
       cursorBlink: true,
       convertEol: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: 13,
+      fontSize: 12,
+      linkHandler: {
+        activate: (event, text) => {
+          event.preventDefault();
+          openExternalTerminalLink(text);
+        },
+      },
       theme: {
         background: "#111827",
         foreground: "#e5e7eb",
@@ -83,6 +101,10 @@ export function TerminalPanel({
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
+    terminal.loadAddon(new WebLinksAddon((event, uri) => {
+      event.preventDefault();
+      openExternalTerminalLink(uri);
+    }));
     terminal.open(hostRef.current);
     fitAddon.fit();
     terminalRef.current = terminal;

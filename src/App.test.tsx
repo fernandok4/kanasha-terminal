@@ -617,8 +617,8 @@ describe("KanashaTerminal", () => {
     });
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Ações do perfil Antigravity" }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Configurar nesta sessão/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Gerenciar perfis" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Configurar Antigravity/ }));
     fireEvent.change(screen.getByLabelText("Executável local"), { target: { value: "antigravity" } });
     fireEvent.click(screen.getByRole("button", { name: "Configurar" }));
 

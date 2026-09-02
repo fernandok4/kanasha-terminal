@@ -8,19 +8,33 @@ const mocks = vi.hoisted(() => ({
   open: vi.fn(),
   onData: undefined as undefined | ((input: string) => void),
   invoke: vi.fn(),
+  openUrl: vi.fn().mockResolvedValue(undefined),
+  webLinkHandler: undefined as undefined | ((event: MouseEvent, uri: string) => void),
+  linkHandler: undefined as undefined | { activate: (event: MouseEvent, text: string) => void },
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => undefined) }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mocks.openUrl }));
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     fit = mocks.fit;
+  },
+}));
+vi.mock("@xterm/addon-web-links", () => ({
+  WebLinksAddon: class {
+    constructor(handler: (event: MouseEvent, uri: string) => void) {
+      mocks.webLinkHandler = handler;
+    }
   },
 }));
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     cols = 120;
     rows = 36;
+    constructor(options: { linkHandler?: { activate: (event: MouseEvent, text: string) => void } }) {
+      mocks.linkHandler = options.linkHandler;
+    }
     loadAddon = vi.fn();
     open = mocks.open;
     focus = mocks.focus;
@@ -44,7 +58,10 @@ describe("TerminalPanel", () => {
     mocks.fit.mockReset();
     mocks.open.mockReset();
     mocks.invoke.mockReset();
+    mocks.openUrl.mockReset().mockResolvedValue(undefined);
     mocks.onData = undefined;
+    mocks.webLinkHandler = undefined;
+    mocks.linkHandler = undefined;
     vi.stubGlobal("ResizeObserver", ResizeObserverMock);
   });
 
@@ -79,5 +96,32 @@ describe("TerminalPanel", () => {
       terminalId: "painel-1",
       input: "texto-colado",
     });
+  });
+
+  it("abre somente links HTTP(S) reconhecidos pelo terminal no navegador padrão", async () => {
+    render(
+      <TerminalPanel
+        panel={{ id: "painel-1", title: "Shell", profileId: "shell" }}
+        active
+        focused={false}
+        maximized={false}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onClose={vi.fn()}
+        onSplit={vi.fn()}
+        onFocus={vi.fn()}
+        onToggleMaximize={vi.fn()}
+        onContextMenu={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(mocks.webLinkHandler).toBeTypeOf("function"));
+    const webLinkClick = new MouseEvent("click", { cancelable: true });
+    mocks.webLinkHandler?.(webLinkClick, "https://kanasha.com.br/docs");
+    expect(webLinkClick.defaultPrevented).toBe(true);
+    expect(mocks.openUrl).toHaveBeenCalledWith("https://kanasha.com.br/docs");
+
+    mocks.linkHandler?.activate(new MouseEvent("click"), "file:///tmp/nao-abrir");
+    expect(mocks.openUrl).toHaveBeenCalledTimes(1);
   });
 });

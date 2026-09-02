@@ -527,23 +527,30 @@ function App() {
     ];
   }
 
-  function profileMenu(profile: ProfileView): MenuEntry[] {
-    if (profile.builtIn) return [];
+  function profilesMenu(): MenuEntry[] {
+    const customProfiles = (snapshot?.profiles ?? []).filter((profile) => !profile.builtIn);
     return [
       {
-        label: "Configurar nesta sessão",
-        description: "Informa executável e argumentos apenas para a sessão atual.",
-        action: () => openProfileConfiguration(profile),
+        label: "Criar perfil local",
+        description: "Cria um perfil para selecionar no topo desta tela.",
+        action: openNewProfileDialog,
       },
-      {
-        label: "Remover perfil",
-        description: "Remove o metadado local; não remove arquivos nem comandos.",
-        action: () => {
-          if (window.confirm(`Remover o perfil ${profile.name}?`)) {
-            void run(terminalApi.removeCustomProfile(profile.id));
-          }
+      ...customProfiles.flatMap((profile) => [
+        {
+          label: `Configurar ${profile.name}`,
+          description: "Informa executável e argumentos apenas para a sessão atual.",
+          action: () => openProfileConfiguration(profile),
         },
-      },
+        {
+          label: `Remover ${profile.name}`,
+          description: "Remove o metadado local; não remove arquivos nem comandos.",
+          action: () => {
+            if (window.confirm(`Remover o perfil ${profile.name}?`)) {
+              void run(terminalApi.removeCustomProfile(profile.id));
+            }
+          },
+        },
+      ]),
     ];
   }
 
@@ -628,17 +635,6 @@ function App() {
             </div>
           ))}
         </nav>
-        <div className="profile-list">
-          <div className="sidebar-heading"><span>Perfis</span><button title="Criar perfil local" aria-label="Criar perfil local" onClick={openNewProfileDialog}>+</button></div>
-          {snapshot.profiles.map((profile) => (
-            <div className="profile-row" key={profile.id}>
-              <button className={`profile-item ${profile.id === selectedProfileId ? "selected" : ""}`} title={profile.available ? `Usar perfil ${profile.name}` : `${profile.name} indisponível ou não configurado`} onClick={() => setSelectedProfileId(profile.id)} onContextMenu={profile.builtIn ? undefined : (event) => showMenu(event, profileMenu(profile))}>
-                <span className={`availability ${profile.available ? "available" : "unavailable"}`} aria-hidden="true" /><span>{profile.name}</span>
-              </button>
-              {!profile.builtIn ? <button className="context-trigger" title={`Ações do perfil ${profile.name}`} aria-label={`Ações do perfil ${profile.name}`} aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profileMenu(profile))}>⋯</button> : null}
-            </div>
-          ))}
-        </div>
       </aside>
 
       <section className="workspace-shell">
@@ -657,8 +653,9 @@ function App() {
           </header>
           {selectedWorkspace ? <>
             <div className="workspace-toolbar">
-              <label htmlFor="profile-select">Perfil para novos painéis</label>
+              <label htmlFor="profile-select">Perfil</label>
               <select id="profile-select" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>{snapshot.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.available ? "" : " — indisponível"}</option>)}</select>
+              <button className="toolbar-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Perfis</button>
               <button title="Adicionar novo terminal" onClick={() => void addTerminal()}>+ Terminal</button>
               <span className="privacy-note">Nada digitado ou exibido no terminal é salvo.</span>
             </div>
@@ -671,7 +668,7 @@ function App() {
               }))}
             </section>
           </> : null}
-        </> : <section className="empty-workspace onboarding"><p className="eyebrow">Primeiro uso</p><h1>Organize seus agentes por área e workspace.</h1><p>Uma Área aponta para uma pasta-raiz local. Dentro dela você cria workspaces e abre terminais em paralelo.</p><button title="Criar primeira área" onClick={() => setAreaDialogOpen(true)}>Criar primeira área</button></section>}
+        </> : <section className="empty-workspace onboarding"><p className="eyebrow">Primeiro uso</p><h1>Organize seus agentes por área e workspace.</h1><p>Uma Área aponta para uma pasta-raiz local. Dentro dela você cria workspaces e abre terminais em paralelo.</p><button title="Criar primeira área" onClick={() => setAreaDialogOpen(true)}>Criar primeira área</button><button className="onboarding-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Gerenciar perfis</button></section>}
       </section>
 
       {error ? <div className="error-toast" role="alert">{error}<button title="Fechar mensagem" onClick={() => setError(null)}>×</button></div> : null}
