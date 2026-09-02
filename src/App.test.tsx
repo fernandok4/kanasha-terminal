@@ -278,6 +278,51 @@ describe("KanashaTerminal", () => {
     expect(firstPanel.parentElement).not.toHaveClass("is-hidden");
   });
 
+  it("mantém o painel montado ao alternar áreas para preservar o buffer efêmero", async () => {
+    const initial: AppSnapshot = {
+      areas: [
+        {
+          id: "area-1",
+          name: "Plataforma",
+          rootPath: "/tmp/plataforma",
+          workspaces: [{
+            id: "workspace-1",
+            name: "Investigação",
+            panels: [{ id: "panel-1", title: "Terminal 1", profileId: "shell" }],
+            layout: { kind: "panel", panelId: "panel-1" },
+          }],
+        },
+        {
+          id: "area-2",
+          name: "Integrações",
+          rootPath: "/tmp/integracoes",
+          workspaces: [{
+            id: "workspace-2",
+            name: "Implementação",
+            panels: [{ id: "panel-2", title: "Terminal 2", profileId: "shell" }],
+            layout: { kind: "panel", panelId: "panel-2" },
+          }],
+        },
+      ],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: ["panel-1", "panel-2"],
+    };
+    invoke.mockResolvedValue(initial);
+
+    render(<App />);
+    const firstPanel = await screen.findByTestId("terminal-panel-panel-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Integrações" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Implementação" })).toHaveAttribute("aria-selected", "true"));
+    expect(screen.getByTestId("terminal-panel-panel-1")).toBe(firstPanel);
+    expect(firstPanel.parentElement).toHaveClass("is-hidden");
+
+    fireEvent.click(screen.getByRole("button", { name: "Plataforma" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Investigação" })).toHaveAttribute("aria-selected", "true"));
+    expect(screen.getByTestId("terminal-panel-panel-1")).toBe(firstPanel);
+    expect(firstPanel.parentElement).not.toHaveClass("is-hidden");
+  });
+
   it("remove um painel de quatro sem manter um ramo de split ou scroll residual", async () => {
     let current: AppSnapshot = {
       areas: [

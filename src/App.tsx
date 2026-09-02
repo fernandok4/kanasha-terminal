@@ -71,11 +71,11 @@ function App() {
   const closingAfterConfirmation = useRef(false);
 
   const selectedArea = useMemo(
-    () => snapshot?.areas.find((area) => area.id === selectedAreaId) ?? null,
+    () => snapshot?.areas.find((area) => area.id === selectedAreaId) ?? snapshot?.areas[0] ?? null,
     [snapshot, selectedAreaId],
   );
   const selectedWorkspace = useMemo(
-    () => selectedArea?.workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? null,
+    () => selectedArea?.workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? selectedArea?.workspaces[0] ?? null,
     [selectedArea, selectedWorkspaceId],
   );
   const activeIds = useMemo(
@@ -638,7 +638,7 @@ function App() {
       </aside>
 
       <section className="workspace-shell">
-        {selectedArea ? <>
+        {selectedArea ? (
           <header className="workspace-tabs" aria-label="Workspaces">
             <span className="area-path" title={selectedArea.rootPath}>{selectedArea.name}</span>
             <div className="tabs" role="tablist" aria-label={`Workspaces de ${selectedArea.name}`}>
@@ -651,24 +651,28 @@ function App() {
               <button className="tab add-tab" title="Criar novo workspace" aria-label="Criar novo workspace" onClick={openCreateWorkspaceDialog}>+</button>
             </div>
           </header>
-          {selectedWorkspace ? <>
-            <div className="workspace-toolbar">
-              <label htmlFor="profile-select">Perfil</label>
-              <select id="profile-select" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>{snapshot.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.available ? "" : " — indisponível"}</option>)}</select>
-              <button className="toolbar-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Perfis</button>
-              <button title="Adicionar novo terminal" onClick={() => void addTerminal()}>+ Terminal</button>
-              <span className="privacy-note">Nada digitado ou exibido no terminal é salvo.</span>
-            </div>
-            <section className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""}`} aria-label={`Terminais de ${selectedWorkspace.name}`}>
-              {snapshot.areas.flatMap((area) => area.workspaces.map((workspace) => {
-                const isSelected = workspace.id === selectedWorkspace.id;
-                return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
-                  {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
-                </div>;
-              }))}
-            </section>
-          </> : null}
-        </> : <section className="empty-workspace onboarding"><p className="eyebrow">Primeiro uso</p><h1>Organize seus agentes por área e workspace.</h1><p>Uma Área aponta para uma pasta-raiz local. Dentro dela você cria workspaces e abre terminais em paralelo.</p><button title="Criar primeira área" onClick={() => setAreaDialogOpen(true)}>Criar primeira área</button><button className="onboarding-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Gerenciar perfis</button></section>}
+        ) : snapshot.areas.length === 0 ? (
+          <section className="empty-workspace onboarding"><p className="eyebrow">Primeiro uso</p><h1>Organize seus agentes por área e workspace.</h1><p>Uma Área aponta para uma pasta-raiz local. Dentro dela você cria workspaces e abre terminais em paralelo.</p><button title="Criar primeira área" onClick={() => setAreaDialogOpen(true)}>Criar primeira área</button><button className="onboarding-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Gerenciar perfis</button></section>
+        ) : null}
+        {selectedWorkspace ? <div className="workspace-toolbar">
+          <label htmlFor="profile-select">Perfil</label>
+          <select id="profile-select" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>{snapshot.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.available ? "" : " — indisponível"}</option>)}</select>
+          <button className="toolbar-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Perfis</button>
+          <button title="Adicionar novo terminal" onClick={() => void addTerminal()}>+ Terminal</button>
+          <span className="privacy-note">Nada digitado ou exibido no terminal é salvo.</span>
+        </div> : null}
+        <section
+          className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""}`}
+          aria-label={selectedWorkspace ? `Terminais de ${selectedWorkspace.name}` : "Terminais"}
+          hidden={!selectedWorkspace}
+        >
+          {snapshot.areas.flatMap((area) => area.workspaces.map((workspace) => {
+            const isSelected = workspace.id === selectedWorkspace?.id;
+            return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
+              {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
+            </div>;
+          }))}
+        </section>
       </section>
 
       {error ? <div className="error-toast" role="alert">{error}<button title="Fechar mensagem" onClick={() => setError(null)}>×</button></div> : null}
