@@ -19,9 +19,36 @@ export interface TerminalPanelModel {
   profileId: string;
 }
 
+export type TaskStatus =
+  | "not_started"
+  | "in_progress"
+  | "waiting"
+  | "blocked"
+  | "done";
+
+export interface TaskState {
+  status: TaskStatus;
+  summary?: string;
+  current?: string;
+  next?: string;
+  blocker?: string;
+  updatedAt?: number;
+  revision?: number;
+}
+
+export type AgentStatus = "idle" | "working" | "waiting" | "blocked" | "done";
+
+export interface AgentState {
+  status: AgentStatus;
+  current?: string;
+  updatedAt?: number;
+  revision?: number;
+}
+
 export interface Workspace {
   id: string;
   name: string;
+  task?: TaskState;
   panels: TerminalPanelModel[];
   layout: LayoutNode | null;
 }
@@ -45,6 +72,7 @@ export interface AppSnapshot {
   areas: Area[];
   profiles: ProfileView[];
   activeTerminalIds: string[];
+  agentStates?: Record<string, AgentState>;
 }
 
 export interface TerminalOutput {

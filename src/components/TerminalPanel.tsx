@@ -6,7 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef } from "react";
 import { terminalApi } from "../api";
-import type { TerminalExit, TerminalOutput, TerminalPanelModel } from "../types";
+import type { AgentStatus, TerminalExit, TerminalOutput, TerminalPanelModel } from "../types";
 
 function openExternalTerminalLink(value: string) {
   try {
@@ -21,6 +21,7 @@ function openExternalTerminalLink(value: string) {
 type TerminalPanelProps = {
   panel: TerminalPanelModel;
   active: boolean;
+  agentStatus?: AgentStatus;
   focused: boolean;
   maximized: boolean;
   onStart: (terminalId: string) => void;
@@ -35,6 +36,7 @@ type TerminalPanelProps = {
 export function TerminalPanel({
   panel,
   active,
+  agentStatus,
   focused,
   maximized,
   onStart,
@@ -151,6 +153,15 @@ export function TerminalPanel({
         [...panel.label].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 4
       ]
     : null;
+  const effectiveAgentStatus = active ? (agentStatus ?? "idle") : "offline";
+  const agentStatusLabel = {
+    offline: "Parado",
+    idle: "Disponível",
+    working: "Trabalhando",
+    waiting: "Aguardando",
+    blocked: "Bloqueado",
+    done: "Concluído",
+  }[effectiveAgentStatus];
 
   return (
     <section
@@ -163,11 +174,11 @@ export function TerminalPanel({
       onContextMenu={(event) => onContextMenu(event, panel.id)}
     >
       <header className="terminal-header">
-        <span className={`terminal-status ${active ? "is-active" : ""}`} aria-hidden="true" />
+        <span className={`terminal-status agent-${effectiveAgentStatus}`} aria-hidden="true" />
         <strong>{panel.title}</strong>
         {panel.label ? <span className={`terminal-label ${labelTone ? `tone-${labelTone}` : ""}`}>{panel.label}</span> : null}
         <span className="terminal-profile">{panel.profileId}</span>
-        <span className="terminal-state" role="status">{active ? "Em execução" : "Parado"}</span>
+        <span className="terminal-state" role="status">{agentStatusLabel}</span>
         <div className="terminal-actions">
           {active ? (
             <button title="Encerrar processo" aria-label={`Encerrar ${panel.title}`} onClick={() => onStop(panel.id)}>

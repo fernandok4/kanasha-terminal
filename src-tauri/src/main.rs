@@ -2,5 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    kanasha_terminal_lib::run()
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--mcp")) {
+        kanasha_terminal_lib::run_mcp();
+    } else {
+        kanasha_terminal_lib::run();
+    }
 }

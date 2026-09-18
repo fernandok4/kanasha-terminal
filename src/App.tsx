@@ -5,11 +5,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { terminalApi } from "./api";
 import { TerminalPanel } from "./components/TerminalPanel";
 import type {
+  AgentState,
+  AgentStatus,
   AppSnapshot,
   Area,
   LayoutNode,
   ProfileView,
   SplitDirection,
+  TaskState,
+  TaskStatus,
   TerminalPanelModel,
   Workspace,
 } from "./types";
@@ -17,6 +21,7 @@ import "./App.css";
 
 type MenuEntry = { label: string; description: string; action: () => void };
 type ContextMenuState = { x: number; y: number; entries: MenuEntry[] } | null;
+type WorkspaceView = "terminals" | "summary";
 type TextDialogState =
   | { kind: "create-workspace"; areaId: string }
   | { kind: "rename-area"; areaId: string }
@@ -26,6 +31,46 @@ type TextDialogState =
 
 const MIN_SPLIT_RATIO = 0.15;
 const MAX_SPLIT_RATIO = 0.85;
+const EMPTY_TASK: TaskState = { status: "not_started" };
+const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
+  not_started: "Não iniciada",
+  in_progress: "Em andamento",
+  waiting: "Aguardando",
+  blocked: "Bloqueada",
+  done: "Concluída",
+};
+type AgentTone = AgentStatus | "offline";
+const AGENT_STATUS_LABELS: Record<AgentTone, string> = {
+  offline: "Desconectado",
+  idle: "Disponível",
+  working: "Trabalhando",
+  waiting: "Aguardando",
+  blocked: "Bloqueado",
+  done: "Concluído",
+};
+
+function agentTone(
+  terminalId: string,
+  activeIds: Set<string>,
+  agentStates: Record<string, AgentState>,
+): AgentTone {
+  if (!activeIds.has(terminalId)) return "offline";
+  return agentStates[terminalId]?.status ?? "idle";
+}
+
+function workspaceAgentTone(
+  workspace: Workspace,
+  activeIds: Set<string>,
+  agentStates: Record<string, AgentState>,
+): AgentTone {
+  const statuses = workspace.panels.map((panel) => agentTone(panel.id, activeIds, agentStates));
+  if (statuses.includes("working")) return "working";
+  if (statuses.includes("blocked")) return "blocked";
+  if (statuses.includes("waiting")) return "waiting";
+  if (statuses.includes("done")) return "done";
+  if (statuses.includes("idle")) return "idle";
+  return "offline";
+}
 
 function clampRatio(value: number) {
   return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, value));
@@ -68,6 +113,7 @@ function App() {
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null);
   const [maximizedPanelId, setMaximizedPanelId] = useState<string | null>(null);
   const [pendingSplitRatios, setPendingSplitRatios] = useState<Record<string, number>>({});
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("terminals");
   const closingAfterConfirmation = useRef(false);
 
   const selectedArea = useMemo(
@@ -82,6 +128,7 @@ function App() {
     () => new Set(snapshot?.activeTerminalIds ?? []),
     [snapshot?.activeTerminalIds],
   );
+  const agentStates = snapshot?.agentStates ?? {};
   const renderedWorkspaces = useMemo(
     () => (snapshot?.areas.flatMap((area) => area.workspaces) ?? [])
       .sort((left, right) => left.id.localeCompare(right.id)),
@@ -100,6 +147,21 @@ function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen("terminal-exit", () => {
+      void refresh();
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("task-state-changed", () => {
       void refresh();
     }).then((stopListening) => {
       if (disposed) stopListening();
@@ -647,12 +709,13 @@ function App() {
           <header className="workspace-tabs" aria-label="Workspaces">
             <span className="area-path" title={selectedArea.rootPath}>{selectedArea.name}</span>
             <div className="tabs" role="tablist" aria-label={`Workspaces de ${selectedArea.name}`}>
-              {selectedArea.workspaces.map((workspace) => (
-                <div className="tab-group" key={workspace.id}>
-                  <button role="tab" aria-selected={workspace.id === selectedWorkspace?.id} className={workspace.id === selectedWorkspace?.id ? "tab selected" : "tab"} title={`Selecionar workspace ${workspace.name}`} onClick={() => setSelectedWorkspaceId(workspace.id)} onContextMenu={(event) => showMenu(event, workspaceMenu(workspace))}>{workspace.name}</button>
+              {selectedArea.workspaces.map((workspace) => {
+                const tone = workspaceAgentTone(workspace, activeIds, agentStates);
+                return <div className={`tab-group agent-${tone}`} data-agent-status={tone} key={workspace.id}>
+                  <button role="tab" aria-selected={workspace.id === selectedWorkspace?.id} className={workspace.id === selectedWorkspace?.id ? "tab selected" : "tab"} title={`${workspace.name}: ${AGENT_STATUS_LABELS[tone]}`} onClick={() => setSelectedWorkspaceId(workspace.id)} onContextMenu={(event) => showMenu(event, workspaceMenu(workspace))}><span className="workspace-agent-dot" aria-hidden="true" />{workspace.name}</button>
                   <button className="context-trigger tab-context-trigger" title={`Ações do workspace ${workspace.name}`} aria-label={`Ações do workspace ${workspace.name}`} aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, workspaceMenu(workspace))}>⋯</button>
-                </div>
-              ))}
+                </div>;
+              })}
               <button className="tab add-tab" title="Criar novo workspace" aria-label="Criar novo workspace" onClick={openCreateWorkspaceDialog}>+</button>
             </div>
           </header>
@@ -664,20 +727,24 @@ function App() {
           <select id="profile-select" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>{snapshot.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.available ? "" : " — indisponível"}</option>)}</select>
           <button className="toolbar-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Perfis</button>
           <button title="Adicionar novo terminal" onClick={() => void addTerminal()}>+ Terminal</button>
-          <span className="privacy-note">Nada digitado ou exibido no terminal é salvo.</span>
+          <button className={`toolbar-secondary summary-toggle ${workspaceView === "summary" ? "is-active" : ""}`} title={workspaceView === "summary" ? "Voltar aos terminais" : "Ver resumo da tarefa"} aria-pressed={workspaceView === "summary"} onClick={() => setWorkspaceView((current) => current === "summary" ? "terminals" : "summary")}>{workspaceView === "summary" ? "Terminais" : "Resumo"}</button>
+          <span className={`task-status-dot agent-${workspaceAgentTone(selectedWorkspace, activeIds, agentStates)}`} title={`Agentes: ${AGENT_STATUS_LABELS[workspaceAgentTone(selectedWorkspace, activeIds, agentStates)]}`} aria-hidden="true" />
+          <span className="privacy-note">{workspaceView === "summary" ? "Resumo salvo somente neste dispositivo." : "Nada digitado ou exibido no terminal é salvo."}</span>
         </div> : null}
         <section
-          className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""}`}
+          className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""} ${workspaceView === "summary" ? "is-hidden" : ""}`}
           aria-label={selectedWorkspace ? `Terminais de ${selectedWorkspace.name}` : "Terminais"}
+          aria-hidden={workspaceView === "summary" || !selectedWorkspace}
           hidden={!selectedWorkspace}
         >
           {renderedWorkspaces.map((workspace) => {
             const isSelected = workspace.id === selectedWorkspace?.id;
             return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
-              {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
+              {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} agentStates={agentStates} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
             </div>;
           })}
         </section>
+        {selectedWorkspace ? <TaskSummary workspace={selectedWorkspace} activeIds={activeIds} agentStates={agentStates} visible={workspaceView === "summary"} /> : null}
       </section>
 
       {error ? <div className="error-toast" role="alert">{error}<button title="Fechar mensagem" onClick={() => setError(null)}>×</button></div> : null}
@@ -689,10 +756,96 @@ function App() {
   );
 }
 
+function TaskSummary({ workspace, activeIds, agentStates, visible }: { workspace: Workspace; activeIds: Set<string>; agentStates: Record<string, AgentState>; visible: boolean }) {
+  const task = workspace.task ?? EMPTY_TASK;
+  const hasContext = Boolean(task.summary || task.current || task.next || task.blocker);
+  const agents = workspace.panels.map((panel) => {
+    const tone = agentTone(panel.id, activeIds, agentStates);
+    return { panel, tone, state: agentStates[panel.id] };
+  });
+  const workingAgents = agents.filter((agent) => agent.tone === "working").length;
+  const updatedAt = task.updatedAt
+    ? new Intl.DateTimeFormat("pt-BR", {
+        dateStyle: "short",
+        timeStyle: "short",
+      }).format(new Date(task.updatedAt * 1000))
+    : "Ainda não atualizado";
+
+  return (
+    <section className={`task-summary-stage ${visible ? "" : "is-hidden"}`} aria-label={`Resumo da tarefa ${workspace.name}`} aria-hidden={!visible}>
+      <div className="task-summary-content">
+        <header className="task-summary-header">
+          <div>
+            <p className="eyebrow">Contexto do workspace</p>
+            <h1>{workspace.name}</h1>
+          </div>
+          <span className={`task-status status-${task.status}`}>{TASK_STATUS_LABELS[task.status]}</span>
+        </header>
+
+        {hasContext ? (
+          <div className="task-summary-grid">
+            <article className="task-summary-card task-summary-overview">
+              <span>Resumo atual</span>
+              <p>{task.summary || "O agente ainda não registrou um resumo."}</p>
+            </article>
+            <article className="task-summary-card">
+              <span>Em execução</span>
+              <p>{task.current || "Nenhuma etapa informada."}</p>
+            </article>
+            <article className="task-summary-card">
+              <span>Próximo passo</span>
+              <p>{task.next || "Nenhum próximo passo informado."}</p>
+            </article>
+            {task.blocker ? <article className="task-summary-card task-summary-blocker">
+              <span>Bloqueio</span>
+              <p>{task.blocker}</p>
+            </article> : null}
+          </div>
+        ) : (
+          <div className="task-summary-empty">
+            <span aria-hidden="true">◎</span>
+            <h2>Aguardando contexto da tarefa</h2>
+            <p>O agente deste Workspace publicará aqui o andamento, o próximo passo e eventuais bloqueios.</p>
+          </div>
+        )}
+
+        <section className="agent-summary" aria-label="Status dos agentes">
+          <header>
+            <div>
+              <p className="eyebrow">Agentes deste workspace</p>
+              <h2>Status dos terminais</h2>
+            </div>
+            <span>{workingAgents} trabalhando</span>
+          </header>
+          {agents.length ? <div className="agent-summary-grid">
+            {agents.map(({ panel, tone, state }) => (
+              <article className={`agent-card agent-${tone}`} data-agent-status={tone} key={panel.id}>
+                <div className="agent-card-heading">
+                  <span className="agent-card-dot" aria-hidden="true" />
+                  <strong>{panel.title}</strong>
+                  <span className="agent-status-label">{AGENT_STATUS_LABELS[tone]}</span>
+                </div>
+                <p>{state?.current || (tone === "offline" ? "Terminal parado." : "Aguardando o primeiro reporte do agente.")}</p>
+                <small>{panel.label || panel.profileId}</small>
+              </article>
+            ))}
+          </div> : <p className="agent-summary-empty">Nenhum terminal foi criado neste Workspace.</p>}
+        </section>
+
+        <footer className="task-summary-footer">
+          <span>Atualizado: {updatedAt}</span>
+          {task.revision ? <span>Revisão {task.revision}</span> : null}
+        </footer>
+      </div>
+    </section>
+  );
+}
+
 type LayoutTreeProps = {
   node: LayoutNode;
   panels: TerminalPanelModel[];
   activeIds: Set<string>;
+  agentStates: Record<string, AgentState>;
   focusedPanelId: string | null;
   maximizedPanelId: string | null;
   pendingSplitRatios: Record<string, number>;
@@ -707,10 +860,10 @@ type LayoutTreeProps = {
   onContextMenu: (event: React.MouseEvent, id: string) => void;
 };
 
-function LayoutTree({ node, panels, activeIds, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
+function LayoutTree({ node, panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
   if (node.kind === "panel") {
     const panel = panels.find((item) => item.id === node.panelId);
-    return panel ? <TerminalPanel panel={panel} active={activeIds.has(panel.id)} focused={focusedPanelId === panel.id} maximized={maximizedPanelId === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} /> : null;
+    return panel ? <TerminalPanel panel={panel} active={activeIds.has(panel.id)} agentStatus={agentStates[panel.id]?.status} focused={focusedPanelId === panel.id} maximized={maximizedPanelId === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} /> : null;
   }
   const ratio = clampRatio(pendingSplitRatios[node.id] ?? node.ratio);
   const firstMaximized = Boolean(maximizedPanelId && containsPanel(node.first, maximizedPanelId));
@@ -721,7 +874,7 @@ function LayoutTree({ node, panels, activeIds, focusedPanelId, maximizedPanelId,
   const gridStyle = node.direction === "vertical"
     ? { gridTemplateColumns: bothVisible ? `minmax(0, ${ratio}fr) 9px minmax(0, ${1 - ratio}fr)` : "minmax(0, 1fr)" }
     : { gridTemplateRows: bothVisible ? `minmax(0, ${ratio}fr) 9px minmax(0, ${1 - ratio}fr)` : "minmax(0, 1fr)" };
-  const childProps = { panels, activeIds, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu };
+  const childProps = { panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu };
   return <div className={`terminal-split ${node.direction}`} style={gridStyle}>
     <div className={`layout-branch ${showFirst ? "" : "is-hidden"}`}><LayoutTree node={node.first} {...childProps} /></div>
     {bothVisible ? <SplitDivider splitId={node.id} direction={node.direction} ratio={ratio} onChange={onRatioChange} onCommit={onRatioCommit} /> : null}
