@@ -3,14 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { AppSnapshot } from "./types";
 
-const { invoke, appWindow } = vi.hoisted(() => ({
+const { invoke, appWindow, listen } = vi.hoisted(() => ({
   invoke: vi.fn(),
   appWindow: { close: vi.fn(), onCloseRequested: vi.fn() },
+  listen: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => undefined) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => appWindow,
 }));
@@ -24,6 +25,7 @@ describe("KanashaTerminal", () => {
   beforeEach(() => {
     invoke.mockReset();
     invoke.mockResolvedValue({ areas: [], profiles: [], activeTerminalIds: [] });
+    listen.mockReset().mockResolvedValue(() => undefined);
     appWindow.close.mockReset();
     appWindow.onCloseRequested.mockReset().mockResolvedValue(() => undefined);
   });
@@ -276,6 +278,98 @@ describe("KanashaTerminal", () => {
     await waitFor(() => expect(screen.getByRole("tab", { name: "Investigação" })).toHaveAttribute("aria-selected", "true"));
     expect(screen.getByTestId("terminal-panel-panel-1")).toBe(firstPanel);
     expect(firstPanel.parentElement).not.toHaveClass("is-hidden");
+  });
+
+  it("mostra o resumo da tarefa sem desmontar o terminal", async () => {
+    const initial: AppSnapshot = {
+      areas: [{
+        id: "area-1",
+        name: "Área",
+        rootPath: "/tmp",
+        workspaces: [{
+          id: "workspace-1",
+          name: "Investigação",
+          task: {
+            status: "in_progress",
+            summary: "Investigando a integração MCP.",
+            current: "Validando o estado persistido.",
+            next: "Executar os testes nativos.",
+            updatedAt: 1_700_000_000,
+            revision: 3,
+          },
+          panels: [
+            { id: "panel-1", title: "Implementação", profileId: "codex" },
+            { id: "panel-2", title: "Revisão", profileId: "codex" },
+          ],
+          layout: {
+            kind: "split",
+            id: "split-1",
+            direction: "vertical",
+            ratio: 0.5,
+            first: { kind: "panel", panelId: "panel-1" },
+            second: { kind: "panel", panelId: "panel-2" },
+          },
+        }],
+      }],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: ["panel-1", "panel-2"],
+      agentStates: {
+        "panel-1": { status: "working", current: "Implementando o vínculo MCP." },
+        "panel-2": { status: "waiting", current: "Aguardando a implementação." },
+      },
+    };
+    let current = initial;
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") return Promise.resolve(current);
+      return Promise.reject(new Error(`Comando inesperado: ${command}`));
+    });
+
+    render(<App />);
+    const panel = await screen.findByTestId("terminal-panel-panel-1");
+    const terminalStage = panel.closest(".terminal-stage");
+
+    fireEvent.click(screen.getByRole("button", { name: "Resumo" }));
+
+    expect(screen.getByRole("region", { name: "Resumo da tarefa Investigação" })).toBeInTheDocument();
+    expect(screen.getByText("Investigando a integração MCP.")).toBeInTheDocument();
+    expect(screen.getByText("Em andamento")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Status dos agentes" })).toBeInTheDocument();
+    expect(screen.getByText("Implementando o vínculo MCP.")).toBeInTheDocument();
+    expect(screen.getByText("1 trabalhando")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Investigação" }).parentElement).toHaveAttribute("data-agent-status", "working");
+    expect(screen.getByTestId("terminal-panel-panel-1")).toBe(panel);
+    expect(terminalStage).toHaveClass("is-hidden");
+
+    current = {
+      ...initial,
+      areas: [{
+        ...initial.areas[0],
+        workspaces: [{
+          ...initial.areas[0].workspaces[0],
+          task: {
+            ...initial.areas[0].workspaces[0].task!,
+            current: "Atualização recebida do MCP.",
+            revision: 4,
+          },
+        }],
+      }],
+      agentStates: {
+        "panel-1": { status: "done", current: "Implementação concluída." },
+        "panel-2": { status: "waiting", current: "Aguardando a implementação." },
+      },
+    };
+    const taskListener = listen.mock.calls.find(([event]) => event === "task-state-changed")?.[1];
+    taskListener?.({ payload: "workspace-1" });
+    expect(await screen.findByText("Atualização recebida do MCP.")).toBeInTheDocument();
+    expect(screen.getByText("Implementação concluída.")).toBeInTheDocument();
+    expect(screen.getByText("0 trabalhando")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Investigação" }).parentElement).toHaveAttribute("data-agent-status", "waiting");
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminais" }));
+    expect(screen.getByTestId("terminal-panel-panel-1")).toBe(panel);
+    expect(terminalStage).not.toHaveClass("is-hidden");
+    expect(invoke.mock.calls.some(([command]) => command === "start_terminal")).toBe(false);
+    expect(invoke.mock.calls.some(([command]) => command === "stop_terminal")).toBe(false);
   });
 
   it("não reposiciona o contêiner do terminal ao mover o workspace", async () => {

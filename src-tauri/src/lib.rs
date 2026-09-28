@@ -1,12 +1,14 @@
+mod mcp;
 mod models;
 mod terminal;
 
 use crate::{
     models::{
-        new_id, AppSnapshot, Area, ConfigureProfileInput, CreateAreaInput, CreateTerminalInput,
-        CreateWorkspaceInput, PersistedProfile, PersistedState, ProfileView, ReorderDirection,
-        ResizeTerminalInput, SetSplitRatioInput, SetTerminalLabelInput, SplitDirection,
-        TerminalExit, TerminalOutput, TerminalPanel, Workspace,
+        new_id, AgentState, AppSnapshot, Area, ConfigureProfileInput, CreateAreaInput,
+        CreateTerminalInput, CreateWorkspaceInput, PersistedProfile, PersistedState, ProfileView,
+        ReorderDirection, ResizeTerminalInput, SetSplitRatioInput, SetTerminalLabelInput,
+        SplitDirection, TaskContext, TaskPatch, TaskState, TerminalExit, TerminalOutput,
+        TerminalPanel, Workspace,
     },
     terminal::{start_pty, PtySession},
 };
@@ -15,6 +17,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -35,11 +38,15 @@ struct CommandSpec {
     arguments: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct AppState {
     state_path: PathBuf,
-    persisted: Mutex<PersistedState>,
+    persisted: Arc<Mutex<PersistedState>>,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
-    runtime_profiles: Mutex<HashMap<String, RuntimeProfile>>,
+    agent_states: Arc<Mutex<HashMap<String, AgentState>>>,
+    runtime_profiles: Arc<Mutex<HashMap<String, RuntimeProfile>>>,
+    mcp_socket_path: PathBuf,
+    mcp_token: String,
 }
 
 impl AppState {
@@ -49,7 +56,7 @@ impl AppState {
                 format!("A configuração local está inválida e foi preservada: {error}")
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState {
-                version: 2,
+                version: 3,
                 ..Default::default()
             },
             Err(error) => {
@@ -58,12 +65,19 @@ impl AppState {
                 ))
             }
         };
-        persisted.version = 2;
+        persisted.version = 3;
+        let mcp_socket_path = state_path
+            .parent()
+            .ok_or("O local da configuração é inválido.")?
+            .join(format!("kanasha-mcp-{}.sock", std::process::id()));
         Ok(Self {
             state_path,
-            persisted: Mutex::new(persisted),
+            persisted: Arc::new(Mutex::new(persisted)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            runtime_profiles: Mutex::new(HashMap::new()),
+            agent_states: Arc::new(Mutex::new(HashMap::new())),
+            runtime_profiles: Arc::new(Mutex::new(HashMap::new())),
+            mcp_socket_path,
+            mcp_token: new_id(),
         })
     }
 
@@ -72,10 +86,12 @@ impl AppState {
         let runtime_profiles = guard(&self.runtime_profiles)?;
         let profiles = profile_views(&persisted, &runtime_profiles);
         let active_terminal_ids = guard(&self.sessions)?.keys().cloned().collect();
+        let agent_states = guard(&self.agent_states)?.clone();
         Ok(AppSnapshot {
             areas: persisted.areas.clone(),
             profiles,
             active_terminal_ids,
+            agent_states,
         })
     }
 
@@ -90,6 +106,7 @@ impl AppState {
             workspaces: vec![Workspace {
                 id: new_id(),
                 name: "Workspace 1".to_string(),
+                task: TaskState::default(),
                 panels: Vec::new(),
                 layout: None,
             }],
@@ -148,6 +165,7 @@ impl AppState {
             .push(Workspace {
                 id: new_id(),
                 name: name(&input.name, "workspace")?,
+                task: TaskState::default(),
                 panels: Vec::new(),
                 layout: None,
             });
@@ -292,20 +310,134 @@ impl AppState {
         self.snapshot()
     }
 
+    fn task_context(
+        &self,
+        workspace_id: &str,
+        terminal_id: &str,
+        patch: Option<TaskPatch>,
+    ) -> Result<TaskContext, String> {
+        let patch = patch.filter(|patch| !patch.is_empty());
+        {
+            let persisted = guard(&self.persisted)?;
+            let workspace = find_workspace(&persisted, workspace_id)?;
+            if workspace.panel(terminal_id).is_none() {
+                return Err("O agente não pertence a este Workspace.".to_string());
+            }
+        }
+        let Some(patch) = patch else {
+            let task = guard(&self.persisted)?;
+            let task = find_workspace(&task, workspace_id)?.task.clone();
+            let agent = guard(&self.agent_states)?
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_default();
+            return Ok(TaskContext { task, agent });
+        };
+        let summary = patch
+            .summary
+            .clone()
+            .map(|value| task_text(value, 800, "resumo"))
+            .transpose()?;
+        let current = patch
+            .current
+            .clone()
+            .map(|value| task_text(value, 200, "etapa atual"))
+            .transpose()?;
+        let next = patch
+            .next
+            .clone()
+            .map(|value| task_text(value, 200, "próximo passo"))
+            .transpose()?;
+        let blocker = patch
+            .blocker
+            .clone()
+            .map(|value| task_text(value, 200, "bloqueio"))
+            .transpose()?;
+        let agent_current = patch
+            .agent_current
+            .clone()
+            .map(|value| task_text(value, 160, "andamento do agente"))
+            .transpose()?;
+        let task_changed = patch.has_task_changes();
+        let agent_changed = patch.has_agent_changes();
+        let updated_at = unix_timestamp()?;
+
+        let task = if task_changed {
+            let mut persisted = guard(&self.persisted)?;
+            let workspace = find_workspace_mut(&mut persisted, workspace_id)?;
+            if let Some(status) = patch.status.clone() {
+                workspace.task.status = status;
+            }
+            if let Some(summary) = summary {
+                workspace.task.summary = summary;
+            }
+            if let Some(current) = current {
+                workspace.task.current = current;
+            }
+            if let Some(next) = next {
+                workspace.task.next = next;
+            }
+            if let Some(blocker) = blocker {
+                workspace.task.blocker = blocker;
+            }
+            workspace.task.revision = workspace.task.revision.saturating_add(1);
+            workspace.task.updated_at = updated_at;
+            let task = workspace.task.clone();
+            self.save(&persisted)?;
+            task
+        } else {
+            let persisted = guard(&self.persisted)?;
+            find_workspace(&persisted, workspace_id)?.task.clone()
+        };
+        let agent = if agent_changed {
+            let mut states = guard(&self.agent_states)?;
+            let agent = states.entry(terminal_id.to_string()).or_default();
+            if let Some(status) = patch.agent_status.clone() {
+                agent.status = status;
+            }
+            if let Some(current) = agent_current {
+                agent.current = current;
+            }
+            agent.revision = agent.revision.saturating_add(1);
+            agent.updated_at = updated_at;
+            agent.clone()
+        } else {
+            guard(&self.agent_states)?
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(TaskContext { task, agent })
+    }
+
     fn start_terminal(&self, app: AppHandle, terminal_id: &str) -> Result<AppSnapshot, String> {
         if guard(&self.sessions)?.contains_key(terminal_id) {
             return self.snapshot();
         }
-        let (root, profile_id) = {
+        let (root, workspace_id, profile_id) = {
             let persisted = guard(&self.persisted)?;
             let (area, workspace) = find_terminal_workspace(&persisted, terminal_id)?;
             let panel = workspace
                 .panel(terminal_id)
                 .ok_or("Terminal não encontrado.")?;
-            (PathBuf::from(&area.root_path), panel.profile_id.clone())
+            (
+                PathBuf::from(&area.root_path),
+                workspace.id.clone(),
+                panel.profile_id.clone(),
+            )
         };
         let spec = self.command_spec(&profile_id)?;
+        let environment = vec![
+            (
+                "KANASHA_MCP_SOCKET".to_string(),
+                self.mcp_socket_path.to_string_lossy().into_owned(),
+            ),
+            ("KANASHA_MCP_TOKEN".to_string(), self.mcp_token.clone()),
+            ("KANASHA_WORKSPACE_ID".to_string(), workspace_id),
+            ("KANASHA_TERMINAL_ID".to_string(), terminal_id.to_string()),
+        ];
         let sessions = Arc::clone(&self.sessions);
+        let agent_states = Arc::clone(&self.agent_states);
         let output_id = terminal_id.to_string();
         let exit_id = terminal_id.to_string();
         let output_app = app.clone();
@@ -313,6 +445,7 @@ impl AppState {
         let session = start_pty(
             &spec.executable,
             &spec.arguments,
+            &environment,
             &root,
             move |data| {
                 let _ = output_app.emit(
@@ -327,6 +460,9 @@ impl AppState {
                 if let Ok(mut active) = sessions.lock() {
                     active.remove(&exit_id);
                 }
+                if let Ok(mut states) = agent_states.lock() {
+                    states.remove(&exit_id);
+                }
                 let _ = exit_app.emit(
                     "terminal-exit",
                     TerminalExit {
@@ -336,6 +472,9 @@ impl AppState {
             },
         )?;
         guard(&self.sessions)?.insert(terminal_id.to_string(), session);
+        guard(&self.agent_states)?
+            .entry(terminal_id.to_string())
+            .or_default();
         self.snapshot()
     }
 
@@ -364,6 +503,7 @@ impl AppState {
             .remove(terminal_id)
             .ok_or("O terminal não está ativo.")?;
         session.stop()?;
+        guard(&self.agent_states)?.remove(terminal_id);
         self.snapshot()
     }
 
@@ -455,9 +595,15 @@ impl AppState {
             if !available(program) {
                 return Err("A CLI deste perfil não está disponível no PATH local.".to_string());
             }
+            let mut arguments = if profile_id == CODEX {
+                codex_mcp_arguments()?
+            } else {
+                Vec::new()
+            };
+            force_yolo(program, &mut arguments);
             return Ok(CommandSpec {
                 executable: program.to_string(),
-                arguments: Vec::new(),
+                arguments,
             });
         }
         let configured = guard(&self.runtime_profiles)?
@@ -467,9 +613,11 @@ impl AppState {
         if !available(&configured.executable) {
             return Err("O executável configurado não está disponível no PATH local.".to_string());
         }
+        let mut arguments = configured.arguments;
+        force_yolo(&configured.executable, &mut arguments);
         Ok(CommandSpec {
             executable: configured.executable,
-            arguments: configured.arguments,
+            arguments,
         })
     }
 
@@ -513,6 +661,21 @@ fn name(value: &str, subject: &str) -> Result<String, String> {
         return Err(format!("Informe um nome válido para {subject}."));
     }
     Ok(value.to_string())
+}
+
+fn task_text(value: String, limit: usize, subject: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.contains('\0') || value.chars().count() > limit {
+        return Err(format!("O {subject} da tarefa excede o limite permitido."));
+    }
+    Ok(value.to_string())
+}
+
+fn unix_timestamp() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "O relógio do sistema está inválido.".to_string())
 }
 
 fn terminal_label(value: Option<String>) -> Result<Option<String>, String> {
@@ -662,6 +825,67 @@ fn builtin(id: &str) -> Option<(&'static str, &'static str)> {
         GEMINI => Some((GEMINI, "Gemini")),
         _ => None,
     }
+}
+
+fn force_yolo(executable: &str, arguments: &mut Vec<String>) {
+    let program = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable)
+        .trim_end_matches(".exe");
+    let (flag, already_enabled) = match program {
+        CODEX => (
+            "--dangerously-bypass-approvals-and-sandbox",
+            arguments.iter().any(|argument| {
+                argument == "--dangerously-bypass-approvals-and-sandbox" || argument == "--yolo"
+            }),
+        ),
+        CLAUDE => (
+            "--dangerously-skip-permissions",
+            arguments
+                .iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+                || arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--permission-mode" && pair[1] == "bypassPermissions")
+                || arguments
+                    .iter()
+                    .any(|argument| argument == "--permission-mode=bypassPermissions"),
+        ),
+        GEMINI => (
+            "--approval-mode=yolo",
+            arguments.iter().any(|argument| {
+                argument == "--approval-mode=yolo" || argument == "--yolo" || argument == "-y"
+            }) || arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--approval-mode" && pair[1] == "yolo"),
+        ),
+        _ => return,
+    };
+    if !already_enabled {
+        arguments.insert(0, flag.to_string());
+    }
+}
+
+fn codex_mcp_arguments() -> Result<Vec<String>, String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("Não foi possível localizar o KanashaTerminal: {error}"))?;
+    let executable = serde_json::to_string(&executable.to_string_lossy())
+        .map_err(|error| format!("Não foi possível configurar o MCP local: {error}"))?;
+    Ok(vec![
+        "-c".into(),
+        format!("mcp_servers.kanasha_terminal.command={executable}"),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.args=[\"--mcp\"]".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.env_vars=[\"KANASHA_MCP_SOCKET\",\"KANASHA_MCP_TOKEN\",\"KANASHA_WORKSPACE_ID\",\"KANASHA_TERMINAL_ID\"]".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.enabled_tools=[\"task_state\"]".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.task_state.output_token_limit=512".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.task_state.approval_mode=\"approve\"".into(),
+    ])
 }
 
 fn profile_views(
@@ -895,7 +1119,9 @@ pub fn run() {
                 .path()
                 .app_config_dir()
                 .map_err(|error| error.to_string())?;
-            app.manage(AppState::load(directory.join("workspace.json"))?);
+            let state = AppState::load(directory.join("workspace.json"))?;
+            mcp::start_listener(state.clone(), app.handle().clone())?;
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -925,6 +1151,10 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao executar o KanashaTerminal");
+}
+
+pub fn run_mcp() {
+    mcp::run_stdio();
 }
 
 #[cfg(test)]
@@ -960,6 +1190,59 @@ mod tests {
         assert!(!saved.contains("secret-command-never-persisted"));
         assert!(!saved.contains("secret-never-persisted"));
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn codex_profile_enables_only_the_compact_kanasha_tool() {
+        let mut arguments = codex_mcp_arguments().expect("Codex MCP arguments");
+        force_yolo(CODEX, &mut arguments);
+        assert_eq!(
+            arguments.first().map(String::as_str),
+            Some("--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(arguments
+            .iter()
+            .any(|argument| argument
+                == "mcp_servers.kanasha_terminal.enabled_tools=[\"task_state\"]"));
+        assert!(arguments.iter().any(|argument| {
+            argument == "mcp_servers.kanasha_terminal.tools.task_state.output_token_limit=512"
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument == "mcp_servers.kanasha_terminal.tools.task_state.approval_mode=\"approve\""
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument.contains("KANASHA_WORKSPACE_ID") && argument.contains("KANASHA_MCP_TOKEN")
+        }));
+    }
+
+    #[test]
+    fn known_agent_profiles_force_yolo_without_duplicating_explicit_modes() {
+        let cases = [
+            (CODEX, "--dangerously-bypass-approvals-and-sandbox"),
+            ("/usr/local/bin/claude", "--dangerously-skip-permissions"),
+            (GEMINI, "--approval-mode=yolo"),
+        ];
+        for (executable, expected) in cases {
+            let mut arguments = vec!["--existing".to_string()];
+            force_yolo(executable, &mut arguments);
+            assert_eq!(arguments[0], expected);
+            force_yolo(executable, &mut arguments);
+            assert_eq!(
+                arguments
+                    .iter()
+                    .filter(|argument| *argument == expected)
+                    .count(),
+                1
+            );
+        }
+
+        let mut custom = vec!["--custom".to_string()];
+        force_yolo("my-agent", &mut custom);
+        assert_eq!(custom, ["--custom"]);
+
+        let mut explicit_gemini = vec!["--yolo".to_string()];
+        force_yolo(GEMINI, &mut explicit_gemini);
+        assert_eq!(explicit_gemini, ["--yolo"]);
     }
 
     #[test]
@@ -1064,6 +1347,173 @@ mod tests {
         let saved = fs::read_to_string(&path).expect("saved state");
         assert!(saved.contains("\"label\": \"revisão\""));
         assert!(saved.contains("\"ratio\": 0.7"));
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn task_and_agent_states_are_scoped_updated_and_persisted_as_expected() {
+        let path = state_path();
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let state = AppState::load(path.clone()).expect("state");
+        let created = state
+            .create_area(CreateAreaInput {
+                name: "Área de teste".into(),
+                root_path: root,
+            })
+            .expect("area");
+        let workspace_id = created.areas[0].workspaces[0].id.clone();
+        let created = state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: workspace_id.clone(),
+                profile_id: SHELL.into(),
+                title: Some("Agente Codex".into()),
+                target_panel_id: None,
+                direction: None,
+            })
+            .expect("terminal");
+        let terminal_id = created.areas[0].workspaces[0].panels[0].id.clone();
+        let created = state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: workspace_id.clone(),
+                profile_id: SHELL.into(),
+                title: Some("Agente revisor".into()),
+                target_panel_id: Some(terminal_id.clone()),
+                direction: Some(SplitDirection::Vertical),
+            })
+            .expect("second terminal");
+        let reviewer_id = created.areas[0].workspaces[0].panels[1].id.clone();
+
+        let first = state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    status: Some(models::TaskStatus::InProgress),
+                    summary: Some("  Implementando o resumo por MCP.  ".into()),
+                    current: Some("Persistindo o estado".into()),
+                    next: Some("Validar a interface".into()),
+                    blocker: None,
+                    agent_status: Some(models::AgentStatus::Working),
+                    agent_current: Some("Implementando o backend".into()),
+                }),
+            )
+            .expect("first update");
+        assert_eq!(first.task.revision, 1);
+        assert_eq!(first.task.summary, "Implementando o resumo por MCP.");
+        assert!(first.task.updated_at > 0);
+        assert_eq!(first.agent.status, models::AgentStatus::Working);
+        assert_eq!(first.agent.current, "Implementando o backend");
+        assert_eq!(first.agent.revision, 1);
+
+        let second = state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    blocker: Some("Aguardando revisão".into()),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("partial update");
+        assert_eq!(second.task.revision, 2);
+        assert_eq!(second.task.summary, first.task.summary);
+        assert_eq!(second.task.blocker, "Aguardando revisão");
+        assert_eq!(second.task.status, models::TaskStatus::InProgress);
+        assert_eq!(second.agent, first.agent);
+
+        let waiting = state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    agent_status: Some(models::AgentStatus::Waiting),
+                    agent_current: Some("Aguardando retorno do usuário".into()),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("agent update");
+        assert_eq!(waiting.task, second.task);
+        assert_eq!(waiting.agent.status, models::AgentStatus::Waiting);
+        assert_eq!(waiting.agent.revision, 2);
+        let reviewer = state
+            .task_context(
+                &workspace_id,
+                &reviewer_id,
+                Some(TaskPatch {
+                    agent_status: Some(models::AgentStatus::Blocked),
+                    agent_current: Some("Revisão bloqueada".into()),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("second agent update");
+        assert_eq!(reviewer.task, waiting.task);
+        assert_eq!(reviewer.agent.status, models::AgentStatus::Blocked);
+        assert_eq!(
+            state
+                .task_context(&workspace_id, &terminal_id, None)
+                .expect("first agent preserved")
+                .agent,
+            waiting.agent
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .expect("snapshot")
+                .agent_states
+                .get(&terminal_id),
+            Some(&waiting.agent)
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .expect("snapshot")
+                .agent_states
+                .get(&reviewer_id),
+            Some(&reviewer.agent)
+        );
+        assert!(state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    status: Some(models::TaskStatus::Done),
+                    summary: Some("x".repeat(801)),
+                    ..TaskPatch::default()
+                }),
+            )
+            .is_err());
+        assert!(state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    agent_status: Some(models::AgentStatus::Done),
+                    agent_current: Some("x".repeat(161)),
+                    ..TaskPatch::default()
+                }),
+            )
+            .is_err());
+        assert_eq!(
+            state
+                .task_context(&workspace_id, &terminal_id, None)
+                .expect("unchanged context"),
+            waiting
+        );
+        drop(state);
+
+        let restored = AppState::load(path.clone()).expect("restored state");
+        let context = restored
+            .task_context(&workspace_id, &terminal_id, None)
+            .expect("restored context");
+        assert_eq!(context.task, second.task);
+        assert_eq!(context.agent, AgentState::default());
+        assert_eq!(
+            restored
+                .task_context(&workspace_id, &reviewer_id, None)
+                .expect("restored reviewer")
+                .agent,
+            AgentState::default()
+        );
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
     }
 

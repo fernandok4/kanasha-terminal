@@ -43,6 +43,7 @@ impl PtySession {
 pub fn start_pty<F, E>(
     executable: &str,
     arguments: &[String],
+    environment: &[(String, String)],
     root_path: &Path,
     on_output: F,
     on_exit: E,
@@ -67,6 +68,9 @@ where
 
     let mut command = CommandBuilder::new(executable);
     command.args(arguments);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
     command.cwd(root_path);
 
     let child = pair
@@ -115,9 +119,14 @@ mod tests {
     fn pty_round_trip_preserves_input_and_output() {
         let output = Arc::new(Mutex::new(String::new()));
         let output_for_callback = Arc::clone(&output);
+        let environment = vec![(
+            "KANASHA_TEST_WORKSPACE".to_string(),
+            "workspace-42".to_string(),
+        )];
         let mut session = start_pty(
             "/bin/sh",
             &[],
+            &environment,
             Path::new("/tmp"),
             move |chunk| {
                 output_for_callback
@@ -130,7 +139,7 @@ mod tests {
         .expect("PTY should start");
 
         session
-            .write("printf 'kanasha-pty-ok\\n'\\n")
+            .write("printf 'kanasha-pty-ok:%s\\n' \"$KANASHA_TEST_WORKSPACE\"\n")
             .expect("PTY should accept input");
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -138,7 +147,7 @@ mod tests {
             if output
                 .lock()
                 .expect("output lock")
-                .contains("kanasha-pty-ok")
+                .contains("kanasha-pty-ok:workspace-42")
             {
                 session.stop().expect("PTY should stop");
                 return;
@@ -161,6 +170,7 @@ mod tests {
         let mut first = start_pty(
             "/bin/sh",
             &[],
+            &[],
             Path::new("/tmp"),
             move |chunk| {
                 first_callback
@@ -173,6 +183,7 @@ mod tests {
         .expect("first PTY should start");
         let mut second = start_pty(
             "/bin/sh",
+            &[],
             &[],
             Path::new("/tmp"),
             move |chunk| {

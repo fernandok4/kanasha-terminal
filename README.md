@@ -6,6 +6,7 @@ Aplicativo desktop local para organizar agentes de terminal em paralelo. A inter
 
 - Áreas de Trabalho vinculadas a uma pasta-raiz.
 - Workspaces em abas dentro de cada Área.
+- Resumo persistente por Workspace e status individual dos agentes, atualizados via MCP local.
 - Vários terminais em painéis com divisões horizontais ou verticais.
 - Divisores arrastáveis e ajustáveis por teclado, com proporções restauradas localmente.
 - Foco rápido entre painéis, maximização temporária, nomes e etiquetas visíveis para identificar cada agente.
@@ -14,11 +15,23 @@ Aplicativo desktop local para organizar agentes de terminal em paralelo. A inter
 - Restauração local de Áreas, Workspaces, layouts, painéis e metadados de perfis. Terminais restaurados ficam parados e podem ser iniciados manualmente.
 - Menus de contexto, atalhos de teclado, tooltips e confirmação antes de encerrar processos.
 
-O terminal sempre inicia na pasta-raiz da Área. Os dados ficam somente no diretório de configuração do aplicativo e não há servidor HTTP, WebSocket ou porta de controle.
+O terminal sempre inicia na pasta-raiz da Área. Os dados ficam somente no diretório de configuração do aplicativo e não há servidor HTTP, WebSocket ou porta de rede. A integração MCP usa STDIO e um socket Unix local protegido, disponível apenas durante a execução do aplicativo.
 
 ## Privacidade da persistência
 
-O aplicativo **não persiste** buffers ou saída de terminal, comandos executados, argumentos de perfil, tokens, segredos, variáveis de ambiente, PIDs ou sessões. Para proteger essa fronteira, o executável e os argumentos de um perfil customizado são mantidos somente em memória: devem ser informados novamente após reiniciar o aplicativo.
+O aplicativo persiste o resumo da tarefa informado pelo agente como parte dos metadados do Workspace. O status individual dos agentes existe somente durante a execução atual. Ele **não persiste** buffers ou saída de terminal, comandos executados, argumentos de perfil, tokens, segredos, variáveis de ambiente, PIDs ou sessões. Para proteger essa fronteira, o executável e os argumentos de um perfil customizado são mantidos somente em memória: devem ser informados novamente após reiniciar o aplicativo.
+
+## Resumo da tarefa via MCP
+
+O botão **Resumo**, ao lado de **+ Terminal**, abre uma tela própria sem desmontar os terminais do Workspace. Além do status da tarefa, a tela mostra cada terminal e seu estado de agente: `Disponível`, `Trabalhando`, `Aguardando`, `Bloqueado`, `Concluído` ou `Desconectado`. A cor da aba do Workspace indica a situação agregada, priorizando `Trabalhando` quando pelo menos um agente está executando uma etapa.
+
+Ao iniciar o perfil **Codex**, o KanashaTerminal configura automaticamente o MCP local no processo. O servidor expõe somente a ferramenta `task_state`: sem argumentos ela lê o contexto compartilhado e o estado do próprio agente; com argumentos ela altera apenas os campos enviados. A resposta de uma atualização é somente `ok`, e o Codex limita a saída da ferramenta a 512 tokens.
+
+Os perfis de agentes sempre iniciam em modo irrestrito, usando a opção própria de cada CLI: `--dangerously-bypass-approvals-and-sandbox` no Codex, `--dangerously-skip-permissions` no Claude e `--approval-mode=yolo` no Gemini. A mesma regra é aplicada a perfis customizados cujo executável seja `codex`, `claude` ou `gemini`, sem duplicar uma opção equivalente já configurada. O perfil Shell e outros executáveis customizados mantêm os argumentos informados, pois não existe uma opção universal de modo irrestrito para comandos arbitrários.
+
+Os campos compartilhados são `status`, `summary`, `current`, `next` e `blocker`. Os campos individuais são `agentStatus` e `agentCurrent`; o terminal é identificado automaticamente, sem enviar IDs na chamada. O agente reporta somente transições e mudanças relevantes de etapa, sem heartbeat periódico, para reduzir o consumo de tokens. Encerrar o processo remove seu estado ativo sem concluir a tarefa automaticamente.
+
+O executável também aceita `--mcp` para uso com outros clientes MCP STDIO. Os terminais recebem `KANASHA_MCP_SOCKET`, `KANASHA_MCP_TOKEN`, `KANASHA_WORKSPACE_ID` e `KANASHA_TERMINAL_ID`; cada cliente precisa encaminhar essas variáveis ao servidor conforme sua própria configuração.
 
 ## Pré-requisitos
 
@@ -101,7 +114,7 @@ Se o build parar em `Running bundle_dmg.sh`, permita que o aplicativo de termina
 ```bash
 npm test
 npm run build
-cd src-tauri && cargo test
+cd src-tauri && cargo fmt --check && cargo test
 npm run tauri build
 ```
 

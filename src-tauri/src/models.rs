@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub fn new_id() -> String {
@@ -19,8 +20,111 @@ pub struct Area {
 pub struct Workspace {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub task: TaskState,
     pub panels: Vec<TerminalPanel>,
     pub layout: Option<LayoutNode>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskState {
+    #[serde(default)]
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub blocker: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    NotStarted,
+    InProgress,
+    Waiting,
+    Blocked,
+    Done,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskPatch {
+    pub status: Option<TaskStatus>,
+    pub summary: Option<String>,
+    pub current: Option<String>,
+    pub next: Option<String>,
+    pub blocker: Option<String>,
+    pub agent_status: Option<AgentStatus>,
+    pub agent_current: Option<String>,
+}
+
+impl TaskPatch {
+    pub fn is_empty(&self) -> bool {
+        self.status.is_none()
+            && self.summary.is_none()
+            && self.current.is_none()
+            && self.next.is_none()
+            && self.blocker.is_none()
+            && self.agent_status.is_none()
+            && self.agent_current.is_none()
+    }
+
+    pub fn has_task_changes(&self) -> bool {
+        self.status.is_some()
+            || self.summary.is_some()
+            || self.current.is_some()
+            || self.next.is_some()
+            || self.blocker.is_some()
+    }
+
+    pub fn has_agent_changes(&self) -> bool {
+        self.agent_status.is_some() || self.agent_current.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentState {
+    #[serde(default)]
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    #[default]
+    Idle,
+    Working,
+    Waiting,
+    Blocked,
+    Done,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskContext {
+    pub task: TaskState,
+    pub agent: AgentState,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -88,7 +192,7 @@ pub struct PersistedState {
 }
 
 fn default_state_version() -> u8 {
-    2
+    3
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,6 +201,7 @@ pub struct AppSnapshot {
     pub areas: Vec<Area>,
     pub profiles: Vec<ProfileView>,
     pub active_terminal_ids: Vec<String>,
+    pub agent_states: HashMap<String, AgentState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -240,6 +345,7 @@ impl Workspace {
         let mut duplicate = self.clone();
         duplicate.id = new_id();
         duplicate.name = format!("{} (cópia)", self.name);
+        duplicate.task = TaskState::default();
 
         let remapped_panels = duplicate
             .panels
@@ -376,6 +482,7 @@ mod tests {
         let mut workspace = Workspace {
             id: new_id(),
             name: "Teste".to_string(),
+            task: TaskState::default(),
             panels: Vec::new(),
             layout: None,
         };
@@ -402,6 +509,7 @@ mod tests {
         let mut workspace = Workspace {
             id: new_id(),
             name: "Teste".to_string(),
+            task: TaskState::default(),
             panels: Vec::new(),
             layout: None,
         };
@@ -469,6 +577,12 @@ mod tests {
         let original = Workspace {
             id: "workspace-original".to_string(),
             name: "Planejamento".to_string(),
+            task: TaskState {
+                status: TaskStatus::Done,
+                summary: "Tarefa original".into(),
+                revision: 2,
+                ..TaskState::default()
+            },
             panels: vec![panel("terminal-original")],
             layout: Some(LayoutNode::Panel {
                 panel_id: "terminal-original".to_string(),
@@ -479,6 +593,7 @@ mod tests {
 
         assert_ne!(duplicate.id, original.id);
         assert_ne!(duplicate.panels[0].id, original.panels[0].id);
+        assert_eq!(duplicate.task, TaskState::default());
         assert_eq!(
             duplicate.layout.unwrap().first_panel_id(),
             Some(duplicate.panels[0].id.as_str())
@@ -502,10 +617,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_workspace_without_task_gets_an_empty_summary() {
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "id": "workspace-legado",
+            "name": "Legado",
+            "panels": [],
+            "layout": null
+        }))
+        .expect("read legacy workspace");
+        assert_eq!(workspace.task, TaskState::default());
+    }
+
+    #[test]
     fn split_ratio_is_persisted_and_legacy_split_gets_safe_defaults() {
         let mut workspace = Workspace {
             id: new_id(),
             name: "Teste".to_string(),
+            task: TaskState::default(),
             panels: vec![panel("first"), panel("second")],
             layout: Some(LayoutNode::Split {
                 id: "split-1".to_string(),
