@@ -82,6 +82,11 @@ function App() {
     () => new Set(snapshot?.activeTerminalIds ?? []),
     [snapshot?.activeTerminalIds],
   );
+  const renderedWorkspaces = useMemo(
+    () => (snapshot?.areas.flatMap((area) => area.workspaces) ?? [])
+      .sort((left, right) => left.id.localeCompare(right.id)),
+    [snapshot],
+  );
   const visiblePanelIds = useMemo(
     () => (selectedWorkspace?.layout ? panelIdsInVisualOrder(selectedWorkspace.layout) : []),
     [selectedWorkspace?.layout],
@@ -666,12 +671,12 @@ function App() {
           aria-label={selectedWorkspace ? `Terminais de ${selectedWorkspace.name}` : "Terminais"}
           hidden={!selectedWorkspace}
         >
-          {snapshot.areas.flatMap((area) => area.workspaces.map((workspace) => {
+          {renderedWorkspaces.map((workspace) => {
             const isSelected = workspace.id === selectedWorkspace?.id;
             return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
               {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
             </div>;
-          }))}
+          })}
         </section>
       </section>
 

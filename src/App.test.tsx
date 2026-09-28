@@ -278,6 +278,64 @@ describe("KanashaTerminal", () => {
     expect(firstPanel.parentElement).not.toHaveClass("is-hidden");
   });
 
+  it("não reposiciona o contêiner do terminal ao mover o workspace", async () => {
+    const initial: AppSnapshot = {
+      areas: [{
+        id: "area-1",
+        name: "Área",
+        rootPath: "/tmp",
+        workspaces: [
+          {
+            id: "workspace-1",
+            name: "Investigação",
+            panels: [{ id: "panel-1", title: "Terminal 1", profileId: "shell" }],
+            layout: { kind: "panel", panelId: "panel-1" },
+          },
+          {
+            id: "workspace-2",
+            name: "Implementação",
+            panels: [{ id: "panel-2", title: "Terminal 2", profileId: "shell" }],
+            layout: { kind: "panel", panelId: "panel-2" },
+          },
+        ],
+      }],
+      profiles: [{ id: "shell", name: "Shell", builtIn: true, available: true, configured: true }],
+      activeTerminalIds: ["panel-1", "panel-2"],
+    };
+    const moved: AppSnapshot = {
+      ...initial,
+      areas: [{
+        ...initial.areas[0],
+        workspaces: [...initial.areas[0].workspaces].reverse(),
+      }],
+    };
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") return Promise.resolve(initial);
+      if (command === "move_workspace") return Promise.resolve(moved);
+      return Promise.reject(new Error(`Comando inesperado: ${command}`));
+    });
+
+    render(<App />);
+    const firstPanel = await screen.findByTestId("terminal-panel-panel-1");
+    const secondPanel = screen.getByTestId("terminal-panel-panel-2");
+    const firstLayout = firstPanel.parentElement;
+    const secondLayout = secondPanel.parentElement;
+    expect(document.querySelectorAll(".workspace-terminal-layout")[0]).toBe(firstLayout);
+
+    fireEvent.click(screen.getByRole("button", { name: "Ações do workspace Investigação" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Mover para direita/ }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("move_workspace", {
+      areaId: "area-1",
+      workspaceId: "workspace-1",
+      direction: "later",
+    }));
+    expect(screen.getByTestId("terminal-panel-panel-1")).toBe(firstPanel);
+    expect(screen.getByTestId("terminal-panel-panel-2")).toBe(secondPanel);
+    expect(document.querySelectorAll(".workspace-terminal-layout")[0]).toBe(firstLayout);
+    expect(document.querySelectorAll(".workspace-terminal-layout")[1]).toBe(secondLayout);
+  });
+
   it("mantém o painel montado ao alternar áreas para preservar o buffer efêmero", async () => {
     const initial: AppSnapshot = {
       areas: [
