@@ -1,3 +1,4 @@
+pub use crate::execution::AgentExecution;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -15,15 +16,34 @@ pub struct Area {
     pub workspaces: Vec<Workspace>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceKind {
+    #[default]
+    Normal,
+    Team,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub task: TaskState,
+    #[serde(default)]
+    pub tasks: Vec<OfficeTask>,
     pub panels: Vec<TerminalPanel>,
     pub layout: Option<LayoutNode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeTask {
+    pub task_code: String,
+    pub state: TaskState,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -33,6 +53,8 @@ pub struct TaskState {
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TaskStep>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub current: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -43,6 +65,14 @@ pub struct TaskState {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskStep {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -56,11 +86,20 @@ pub enum TaskStatus {
     Done,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepStatusPatch {
+    pub id: String,
+    pub status: TaskStatus,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskPatch {
     pub status: Option<TaskStatus>,
     pub summary: Option<String>,
+    pub steps: Option<Vec<TaskStep>>,
+    pub step_status: Option<StepStatusPatch>,
     pub current: Option<String>,
     pub next: Option<String>,
     pub blocker: Option<String>,
@@ -72,6 +111,8 @@ impl TaskPatch {
     pub fn is_empty(&self) -> bool {
         self.status.is_none()
             && self.summary.is_none()
+            && self.steps.is_none()
+            && self.step_status.is_none()
             && self.current.is_none()
             && self.next.is_none()
             && self.blocker.is_none()
@@ -82,6 +123,8 @@ impl TaskPatch {
     pub fn has_task_changes(&self) -> bool {
         self.status.is_some()
             || self.summary.is_some()
+            || self.steps.is_some()
+            || self.step_status.is_some()
             || self.current.is_some()
             || self.next.is_some()
             || self.blocker.is_some()
@@ -135,6 +178,226 @@ pub struct TerminalPanel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<TeamMember>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamMember {
+    #[serde(default)]
+    pub execution: AgentExecution,
+    #[serde(default)]
+    pub professional_profile: Option<ProfessionalProfile>,
+    #[serde(default)]
+    pub automatic_name: bool,
+    #[serde(default)]
+    pub personality: String,
+    #[serde(default)]
+    pub memory: AgentMemory,
+    #[serde(default)]
+    pub soul: AgentSoul,
+    #[serde(default)]
+    pub training: TrainingState,
+    pub specialty: String,
+    pub instructions: String,
+    pub manager: bool,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub session_instructions_hash: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub jobs: Vec<Assignment>,
+    #[serde(default)]
+    pub context_resets: Vec<ContextReset>,
+    #[serde(default)]
+    pub context_task_code: Option<String>,
+    #[serde(default)]
+    pub task_queue: Vec<String>,
+}
+
+/// A proposed identity and the last explicitly reviewed identity are kept separately.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSoul {
+    pub content: String,
+    pub revision: u64,
+    pub updated_at: Option<u64>,
+    pub updated_by: Option<String>,
+    pub approved: Option<ApprovedSoul>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovedSoul {
+    pub content: String,
+    pub revision: u64,
+    pub approved_at: u64,
+    pub approved_by: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfessionalProfile {
+    pub name: String,
+    pub personality: String,
+    pub content: String,
+    pub specialty: String,
+    pub generated_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfessionalProfileInput {
+    pub name: String,
+    pub personality: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextReset {
+    pub id: String,
+    pub previous_thread_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Assignment {
+    #[serde(default)]
+    pub work_contexts: Vec<crate::deliveries::WorkContext>,
+    #[serde(default)]
+    pub deliveries: Vec<crate::deliveries::Delivery>,
+    #[serde(default)]
+    pub step_ids: Vec<String>,
+    #[serde(default)]
+    pub task_code: Option<String>,
+    #[serde(default)]
+    pub fresh_context: bool,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub training: bool,
+    #[serde(default)]
+    pub memory_revision_before: u64,
+    #[serde(default)]
+    pub soul_revision_before: u64,
+    pub id: String,
+    pub message: String,
+    pub assigned_by: Option<String>,
+    pub status: AssignmentStatus,
+    pub result: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Interrupted,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRuntime {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub training_memory_revision_before: Option<u64>,
+    pub training_soul_revision_before: Option<u64>,
+    pub learning_hash: Option<String>,
+    pub connected: bool,
+    pub turn_id: Option<String>,
+    pub activity: String,
+    pub updated_at: u64,
+    pub request: Option<serde_json::Value>,
+    pub instructions_revision: Option<String>,
+    pub instructions_pending: bool,
+    pub instructions_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HireAgentInput {
+    #[serde(default)]
+    pub execution: Option<AgentExecution>,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub name: String,
+    pub specialty: String,
+    #[serde(default)]
+    pub instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditAgentInput {
+    #[serde(default)]
+    pub execution: Option<AgentExecution>,
+    pub terminal_id: String,
+    pub name: String,
+    pub specialty: String,
+    pub instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetContextInput {
+    pub terminal_id: String,
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssignAgentInput {
+    #[serde(default)]
+    pub step_ids: Vec<String>,
+    #[serde(default)]
+    pub task_code: Option<String>,
+    #[serde(default)]
+    pub fresh_context: Option<bool>,
+    #[serde(default)]
+    pub training: bool,
+    pub terminal_id: String,
+    pub request_id: String,
+    pub message: String,
+}
+
+impl TerminalPanel {
+    pub fn manager() -> Self {
+        let id = new_id();
+        let title = crate::learning::generated_name(&id, &[]);
+        let personality = String::new();
+        Self { id, title, label: None, profile_id: "codex".into(),
+            member: Some(TeamMember { execution: AgentExecution::manager(), professional_profile: None, automatic_name: true, personality, memory: AgentMemory::default(), soul: AgentSoul::default(), training: TrainingState::Awaiting, specialty: "Coordenação".into(), instructions: "Esclareça o objetivo com o usuário e coordene a equipe contratada. Distribua trabalho conforme as especialidades e consolide os resultados.".into(), manager: true, thread_id: None, session_instructions_hash: None, paused: false, jobs: Vec::new(), context_resets: Vec::new(), context_task_code: None, task_queue: Vec::new() }) }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemory {
+    pub content: String,
+    pub revision: u64,
+    pub updated_at: Option<u64>,
+    pub updated_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingState {
+    #[default]
+    Awaiting,
+    Learning,
+    Review,
+    Ready,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -202,6 +465,7 @@ pub struct AppSnapshot {
     pub profiles: Vec<ProfileView>,
     pub active_terminal_ids: Vec<String>,
     pub agent_states: HashMap<String, AgentState>,
+    pub member_states: HashMap<String, MemberRuntime>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -217,6 +481,8 @@ pub struct ProfileView {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAreaInput {
+    #[serde(default)]
+    pub workspace_kind: WorkspaceKind,
     pub name: String,
     pub root_path: String,
 }
@@ -224,6 +490,8 @@ pub struct CreateAreaInput {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceInput {
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     pub area_id: String,
     pub name: String,
 }
@@ -283,6 +551,34 @@ pub struct TerminalExit {
 }
 
 impl Workspace {
+    pub fn new(name: String, kind: WorkspaceKind) -> Self {
+        if kind == WorkspaceKind::Team {
+            return Self::with_manager(name);
+        }
+        Self {
+            id: new_id(),
+            name,
+            kind,
+            task: TaskState::default(),
+            tasks: Vec::new(),
+            panels: Vec::new(),
+            layout: None,
+        }
+    }
+    pub fn with_manager(name: String) -> Self {
+        let panel = TerminalPanel::manager();
+        Self {
+            kind: WorkspaceKind::Team,
+            id: new_id(),
+            name,
+            task: TaskState::default(),
+            tasks: Vec::new(),
+            layout: Some(LayoutNode::Panel {
+                panel_id: panel.id.clone(),
+            }),
+            panels: vec![panel],
+        }
+    }
     pub fn add_panel(
         &mut self,
         panel: TerminalPanel,
@@ -346,6 +642,7 @@ impl Workspace {
         duplicate.id = new_id();
         duplicate.name = format!("{} (cópia)", self.name);
         duplicate.task = TaskState::default();
+        duplicate.tasks.clear();
 
         let remapped_panels = duplicate
             .panels
@@ -354,9 +651,26 @@ impl Workspace {
             .collect::<Vec<_>>();
 
         for panel in &mut duplicate.panels {
+            if let Some(member) = &mut panel.member {
+                member.thread_id = None;
+                member.session_instructions_hash = None;
+                member.memory = AgentMemory::default();
+                member.soul = AgentSoul::default();
+                member.training = TrainingState::Awaiting;
+                member.professional_profile = None;
+                member.automatic_name = true;
+                member.jobs.clear();
+                member.context_resets.clear();
+                member.context_task_code = None;
+                member.task_queue.clear();
+                member.paused = false;
+            }
             if let Some((_, replacement)) = remapped_panels.iter().find(|(old, _)| old == &panel.id)
             {
                 panel.id = replacement.clone();
+                if let Some(member) = &mut panel.member {
+                    member.personality.clear();
+                }
             }
         }
 
@@ -474,15 +788,18 @@ mod tests {
             title: id.to_string(),
             label: None,
             profile_id: "shell".to_string(),
+            member: None,
         }
     }
 
     #[test]
     fn split_and_remove_panels_preserves_a_valid_layout() {
         let mut workspace = Workspace {
+            kind: WorkspaceKind::Normal,
             id: new_id(),
             name: "Teste".to_string(),
             task: TaskState::default(),
+            tasks: Vec::new(),
             panels: Vec::new(),
             layout: None,
         };
@@ -507,9 +824,11 @@ mod tests {
     #[test]
     fn removing_one_of_four_panels_collapses_only_its_empty_split() {
         let mut workspace = Workspace {
+            kind: WorkspaceKind::Normal,
             id: new_id(),
             name: "Teste".to_string(),
             task: TaskState::default(),
+            tasks: Vec::new(),
             panels: Vec::new(),
             layout: None,
         };
@@ -575,6 +894,8 @@ mod tests {
     #[test]
     fn duplicated_workspace_uses_new_workspace_and_panel_ids() {
         let original = Workspace {
+            kind: WorkspaceKind::Normal,
+            tasks: Vec::new(),
             id: "workspace-original".to_string(),
             name: "Planejamento".to_string(),
             task: TaskState {
@@ -626,14 +947,27 @@ mod tests {
         }))
         .expect("read legacy workspace");
         assert_eq!(workspace.task, TaskState::default());
+
+        let workspace_with_old_task: Workspace = serde_json::from_value(serde_json::json!({
+            "id": "workspace-antigo",
+            "name": "Antigo",
+            "task": { "status": "in_progress", "summary": "Resumo existente" },
+            "panels": [],
+            "layout": null
+        }))
+        .expect("read task without steps");
+        assert!(workspace_with_old_task.task.steps.is_empty());
+        assert_eq!(workspace_with_old_task.task.summary, "Resumo existente");
     }
 
     #[test]
     fn split_ratio_is_persisted_and_legacy_split_gets_safe_defaults() {
         let mut workspace = Workspace {
+            kind: WorkspaceKind::Normal,
             id: new_id(),
             name: "Teste".to_string(),
             task: TaskState::default(),
+            tasks: Vec::new(),
             panels: vec![panel("first"), panel("second")],
             layout: Some(LayoutNode::Split {
                 id: "split-1".to_string(),

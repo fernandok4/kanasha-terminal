@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSnapshot,
+  AgentExecution,
+  CodexModel,
   ReorderDirection,
   SplitDirection,
 } from "./types";
@@ -14,8 +16,23 @@ type CreateTerminal = {
 };
 
 export const terminalApi = {
+  listCodexModels: (workspaceId: string) => invoke<CodexModel[]>("list_codex_models", { workspaceId }),
+  prepareArea: (areaId: string) => invoke<void>("prepare_area", { areaId }),
+  getAreaInstructions: (areaId: string) => invoke<{ path: string; content: string; revision: string }>("get_area_instructions", { areaId }),
+  setAreaInstructions: (areaId: string, content: string, expectedRevision: string) => invoke<{ path: string; content: string; revision: string }>("set_area_instructions", { areaId, content, expectedRevision }),
+  hireAgent: (input: { workspaceId: string; name?: string; specialty: string; instructions?: string; execution?: AgentExecution }) => invoke<AppSnapshot>("hire_agent", { input }),
+  setAgentMemory: (terminalId: string, content: string, expectedRevision: number) => invoke<AppSnapshot>("set_agent_memory", { terminalId, content, expectedRevision }),
+  setAgentSoul: (terminalId: string, content: string, expectedRevision: number) => invoke<AppSnapshot>("set_agent_soul", { terminalId, content, expectedRevision }),
+  approveAgentSoul: (terminalId: string, expectedRevision: number) => invoke<AppSnapshot>("approve_agent_soul", { terminalId, expectedRevision }),
+  completeTraining: (terminalId: string, expectedRevision: number, expectedSoulRevision: number) => invoke<AppSnapshot>("complete_training", { terminalId, expectedRevision, expectedSoulRevision }),
+  requestOnboarding: (terminalId: string, requestId: string) => invoke<AppSnapshot>("request_onboarding", { terminalId, requestId }),
+  editAgent: (input: { terminalId: string; name: string; specialty: string; instructions: string; execution?: AgentExecution }) => invoke<AppSnapshot>("edit_agent", { input }),
+  resetAgentContext: (terminalId: string, requestId: string) => invoke<AppSnapshot>("reset_agent_context", { input: { terminalId, requestId } }),
+  assignAgent: (input: { terminalId: string; requestId: string; message: string; training?: boolean; freshContext?: boolean; taskCode?: string; stepIds?: string[] }) => invoke<AppSnapshot>("assign_agent", { input }),
+  interruptAgent: (terminalId: string) => invoke<AppSnapshot>("interrupt_agent", { terminalId }),
+  answerAgent: (terminalId: string, requestId: number | string, result: unknown) => invoke<AppSnapshot>("answer_agent", { terminalId, requestId, result }),
   snapshot: () => invoke<AppSnapshot>("get_snapshot"),
-  createArea: (input: { name: string; rootPath: string }) =>
+  createArea: (input: { name: string; rootPath: string; workspaceKind: "normal" | "team" }) =>
     invoke<AppSnapshot>("create_area", { input }),
   renameArea: (areaId: string, name: string) =>
     invoke<AppSnapshot>("rename_area", { areaId, name }),
@@ -24,7 +41,7 @@ export const terminalApi = {
   moveArea: (areaId: string, direction: ReorderDirection) =>
     invoke<AppSnapshot>("move_area", { areaId, direction }),
   removeArea: (areaId: string) => invoke<AppSnapshot>("remove_area", { areaId }),
-  createWorkspace: (input: { areaId: string; name: string }) =>
+  createWorkspace: (input: { areaId: string; name: string; kind: "normal" | "team" }) =>
     invoke<AppSnapshot>("create_workspace", { input }),
   renameWorkspace: (workspaceId: string, name: string) =>
     invoke<AppSnapshot>("rename_workspace", { workspaceId, name }),

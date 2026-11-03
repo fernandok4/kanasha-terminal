@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-BR">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kanasha • Sua equipe</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;color:#ecefe8;background:#151916;--muted:#b0b9ac;--line:#384138;--green:#c3dbab}*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}button{cursor:pointer;background:#293129;color:inherit;border:1px solid #53614e;border-radius:8px;padding:10px 14px}button:hover{background:#394333}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--green);outline-offset:3px}.primary{background:var(--green);color:#192114;border-color:var(--green)}.banner{padding:12px 24px;background:#394330;color:#e7efdc;font-size:14px}main{display:grid;grid-template-columns:210px 1fr;min-height:calc(100vh - 45px)}aside{border-right:1px solid var(--line);padding:26px 20px}h1{font-size:30px;margin:6px 0 10px}h2{font-size:20px}h3{margin:0}p{line-height:1.6}small,.muted{color:var(--muted)}.brand{font-size:23px;letter-spacing:-1px;margin-bottom:42px}.room{padding:14px;background:#303b2c;border-radius:10px;margin:12px 0}.content{padding:36px;max-width:1450px;width:100%;margin:auto}header,.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.overview{display:grid;grid-template-columns:1.1fr 1fr;gap:20px;margin-top:28px}.box{background:#1e251e;border:1px solid var(--line);border-radius:14px;padding:22px}.eyebrow{text-transform:uppercase;letter-spacing:1.5px;font-size:12px;color:var(--green)}.team{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:18px 0}.person{text-align:left;padding:20px;min-height:170px}.person[aria-pressed=true]{border:2px solid var(--green)}.avatar{display:inline-grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#46563c;color:#eff7e8;margin-bottom:14px}.person strong,.person small{display:block}.tag{display:inline-block;font-size:12px;border:1px solid #647357;border-radius:20px;padding:4px 9px;margin:12px 0}.activity{white-space:pre-wrap;background:#111710;padding:18px;border-radius:8px;line-height:1.7;font-family:ui-monospace,monospace;font-size:13px;min-height:100px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}dialog{background:#222b21;color:inherit;border:1px solid #708360;border-radius:16px;padding:28px;width:min(520px,94vw)}dialog::backdrop{background:#0009}label{display:block;margin:18px 0 6px}input,select,textarea{width:100%;border:1px solid #586451;border-radius:8px;background:#151c14;color:inherit;padding:12px}textarea{min-height:110px;resize:vertical}#notice{min-height:24px;color:var(--green);margin-top:18px}a{color:var(--green)}@media(max-width:850px){main{grid-template-columns:1fr}aside{display:none}.content{padding:20px}.overview{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}}
+</style>
+<div class="banner">Protótipo interativo — simulação. Nenhum agente real é iniciado. Os dados são descartados ao recarregar.</div>
+<main>
+<aside><div class="brand">kanasha<span class="muted"> / office</span></div><span class="eyebrow">Empresa</span><h2>Minha empresa</h2><p class="muted">Suas salas</p><div class="room">Produto<br><small>Marina · gerente</small></div><p class="muted">Comece pequeno.<br>Monte a equipe conforme precisar.</p></aside>
+<section class="content">
+<header><div><span class="eyebrow">Minha empresa / Workspace</span><h1>Sala de Produto</h1><div class="muted">Um gerente próximo. Uma equipe que você conhece.</div></div><button class="primary" id="hire">+ Contratar agente</button></header>
+<div class="overview"><section class="box"><span class="eyebrow">Objetivo da sala · exemplo</span><h2>Melhorar a experiência de cadastro</h2><p>Entender as dificuldades, implementar uma melhoria pequena e validar a jornada de quem está chegando.</p><small>O gerente reúne decisões e resultados no resumo da tarefa.</small></section><section class="box"><span class="eyebrow">Como sua equipe funciona</span><p>Você escolhe as pessoas. O gerente distribui o trabalho. As especialidades orientam as atribuições e podem ser ajustadas.</p><small>Execução proposta: Codex com seu login atual, sem exigir API key. Integração ainda não implementada.</small></section></div>
+<div class="row"><h2>Sua equipe</h2><small id="count"></small></div><div class="team" id="team"></div>
+<section class="box" aria-labelledby="member-name"><div class="row"><div><span class="eyebrow" id="member-role"></span><h2 id="member-name"></h2></div><span class="tag" id="member-state"></span></div><p id="member-scope"></p><h3>Atividade · exemplo ilustrativo</h3><pre class="activity" id="activity"></pre><div class="actions"><button id="edit">Editar responsabilidades</button><button id="assign">Simular atribuição</button><button id="stop">Simular interrupção</button><button id="remove">Retirar da equipe</button></div><p class="muted">No aplicativo, este espaço dará acesso ao terminal real da pessoa e aos resultados das atribuições.</p></section>
+<div id="notice" role="status" aria-live="polite"></div><p><a href="visao.md">Ler a proposta de produto e integração</a></p>
+</section></main>
+<dialog id="editor" aria-labelledby="dialog-title"><form id="form"><h2 id="dialog-title">Contratar agente</h2><label for="name">Nome</label><input id="name" required maxlength="60"><label for="specialty">Especialidade</label><input id="specialty" list="specialties" required maxlength="80"><datalist id="specialties"><option value="DEV"><option value="QA"><option value="PO"><option value="Design"><option value="Marketing"></datalist><label for="scope">Responsabilidades e orientações</label><textarea id="scope" required maxlength="2000"></textarea><div class="actions"><button type="submit" class="primary">Salvar</button><button type="button" id="cancel">Cancelar</button></div></form></dialog>
+<dialog id="assignment" aria-labelledby="assignment-title"><form id="assignment-form"><h2 id="assignment-title">Simular atribuição</h2><p>A atribuição será exibida neste protótipo, sem execução real.</p><label for="objective">Objetivo</label><textarea id="objective" required maxlength="1000"></textarea><div class="actions"><button class="primary">Atribuir</button><button type="button" id="cancel-assignment">Cancelar</button></div></form></dialog>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let members=[
+ {id:1,name:'Marina',role:'Gerente',manager:true,scope:'Conversar com você, esclarecer objetivos e coordenar a equipe contratada.',state:'Coordenando',activity:'Aguardando a proposta de Rafael e os critérios de Lia.\nPróximo passo: apresentar a decisão para você.'},
+ {id:2,name:'Rafael',role:'DEV',scope:'Desenvolver e investigar problemas. Pode ajudar a estimar e detalhar soluções.',state:'Trabalhando',activity:'Atribuição: simplificar a validação do formulário.\nAgora: analisando o comportamento atual.'},
+ {id:3,name:'Lia',role:'QA',scope:'Validar jornadas e ajudar a esclarecer critérios de aceite.',state:'Trabalhando',activity:'Atribuição: revisar a jornada de cadastro.\nAgora: descrevendo os cenários essenciais.'}
+];
+let selected=1,editing=false,nextId=4;
+function current(){return members.find(m=>m.id===selected)}
+function notice(text){$('notice').textContent=text}
+function render(){
+ $('team').replaceChildren();$('count').textContent=members.length+' pessoas · dados de exemplo';
+ for(const m of members){const b=document.createElement('button');b.className='person';b.setAttribute('aria-pressed',String(m.id===selected));
+  const avatar=document.createElement('span');avatar.className='avatar';avatar.textContent=m.name.slice(0,1).toUpperCase();
+  const name=document.createElement('strong');name.textContent=m.name;const role=document.createElement('small');role.textContent=m.role;
+  const state=document.createElement('span');state.className='tag';state.textContent=m.state;b.append(avatar,name,role,state);b.onclick=()=>{selected=m.id;render()};$('team').append(b);
+ }
+ const m=current();$('member-name').textContent=m.name;$('member-role').textContent=m.role;$('member-state').textContent=m.state;$('member-scope').textContent=m.scope;$('activity').textContent=m.activity;$('remove').hidden=!!m.manager;
+}
+function openEditor(edit){editing=edit;const m=edit?current():{name:'',role:'DEV',scope:''};$('dialog-title').textContent=edit?'Editar pessoa':'Contratar agente';$('name').value=m.name;$('specialty').value=m.role;$('scope').value=m.scope;$('specialty').readOnly=!!m.manager;$('editor').showModal()}
+$('hire').onclick=()=>openEditor(false);$('edit').onclick=()=>openEditor(true);$('cancel').onclick=()=>$('editor').close();
+$('form').onsubmit=e=>{e.preventDefault();const name=$('name').value.trim(),role=$('specialty').value.trim(),scope=$('scope').value.trim();if(!name||!role||!scope)return;
+ if(editing)Object.assign(current(),{name,role,scope});else{const m={id:nextId++,name,role,scope,state:'Disponível',activity:'Contratado. Aguardando uma atribuição.'};members.push(m);selected=m.id}
+ $('editor').close();render();notice('Equipe atualizada apenas neste protótipo.');
+};
+$('assign').onclick=()=>{$('objective').value='';$('assignment-title').textContent='Atribuição para '+current().name;$('assignment').showModal()};
+$('cancel-assignment').onclick=()=>$('assignment').close();
+$('assignment-form').onsubmit=e=>{e.preventDefault();const objective=$('objective').value.trim();if(!objective)return;Object.assign(current(),{state:'Atribuído',activity:'Atribuição simulada: '+objective+'\nAguardando confirmação de recebimento. Nenhuma execução foi iniciada.'});$('assignment').close();render();notice('Atribuição simulada registrada.');};
+$('stop').onclick=()=>{Object.assign(current(),{state:'Interrompido',activity:'Interrupção simulada pelo usuário.\nNo produto, esta ação depende de confirmação do runtime.'});render();notice('Interrupção simulada.');};
+$('remove').onclick=()=>{const m=current();if(m.manager)return;if(!confirm('Retirar '+m.name+' da equipe deste protótipo?'))return;members=members.filter(person=>person.id!==selected);selected=1;render();notice(m.name+' foi retirado da equipe simulada.');};
+render();
+</script>
+</html>

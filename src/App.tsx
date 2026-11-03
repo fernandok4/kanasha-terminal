@@ -1,9 +1,14 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { terminalApi } from "./api";
+import { workspaceLayout } from "./workspaceLayout";
 import { TerminalPanel } from "./components/TerminalPanel";
+import { TaskMarkdown } from "./components/TaskMarkdown";
+import { TeamView } from "./components/TeamView";
+import { AreaInstructions } from "./components/AreaInstructions";
+import { OfficeView } from "./components/OfficeView";
 import type {
   AgentState,
   AgentStatus,
@@ -16,12 +21,14 @@ import type {
   TaskStatus,
   TerminalPanelModel,
   Workspace,
+  WorkspaceKind,
 } from "./types";
+import { isTeamWorkspace } from "./types";
 import "./App.css";
 
 type MenuEntry = { label: string; description: string; action: () => void };
 type ContextMenuState = { x: number; y: number; entries: MenuEntry[] } | null;
-type WorkspaceView = "terminals" | "summary";
+type WorkspaceView = "terminals" | "summary" | "team" | "office";
 type TextDialogState =
   | { kind: "create-workspace"; areaId: string }
   | { kind: "rename-area"; areaId: string }
@@ -82,12 +89,6 @@ function panelIdsInVisualOrder(node: LayoutNode): string[] {
     : [...panelIdsInVisualOrder(node.first), ...panelIdsInVisualOrder(node.second)];
 }
 
-function containsPanel(node: LayoutNode, panelId: string): boolean {
-  return node.kind === "panel"
-    ? node.panelId === panelId
-    : containsPanel(node.first, panelId) || containsPanel(node.second, panelId);
-}
-
 function errorMessage(error: unknown) {
   return typeof error === "string" ? error : "Não foi possível concluir a ação.";
 }
@@ -99,7 +100,10 @@ function App() {
   const [selectedProfileId, setSelectedProfileId] = useState("shell");
   const [error, setError] = useState<string | null>(null);
   const [areaDialogOpen, setAreaDialogOpen] = useState(false);
+  const [instructionsArea, setInstructionsArea] = useState<{ id: string; name: string } | null>(null);
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  const [areaWorkspaceKind, setAreaWorkspaceKind] = useState<WorkspaceKind>("normal");
+  const [newWorkspaceKind, setNewWorkspaceKind] = useState<WorkspaceKind>("normal");
   const [areaName, setAreaName] = useState("");
   const [areaPath, setAreaPath] = useState("");
   const [profileName, setProfileName] = useState("");
@@ -114,6 +118,10 @@ function App() {
   const [maximizedPanelId, setMaximizedPanelId] = useState<string | null>(null);
   const [pendingSplitRatios, setPendingSplitRatios] = useState<Record<string, number>>({});
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("terminals");
+  const [resettingTerminalIds, setResettingTerminalIds] = useState<Set<string>>(new Set());
+  const pendingResets = useRef(new Set<string>());
+  const resetRequestIds = useRef(new Map<string, string>());
+  const officeNavigation = useRef(0);
   const closingAfterConfirmation = useRef(false);
 
   const selectedArea = useMemo(
@@ -124,6 +132,9 @@ function App() {
     () => selectedArea?.workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? selectedArea?.workspaces[0] ?? null,
     [selectedArea, selectedWorkspaceId],
   );
+  useEffect(() => {
+    if (workspaceView === "team" && (!selectedWorkspace || !isTeamWorkspace(selectedWorkspace))) setWorkspaceView("terminals");
+  }, [selectedWorkspace, workspaceView]);
   const activeIds = useMemo(
     () => new Set(snapshot?.activeTerminalIds ?? []),
     [snapshot?.activeTerminalIds],
@@ -135,9 +146,17 @@ function App() {
     [snapshot],
   );
   const visiblePanelIds = useMemo(
-    () => (selectedWorkspace?.layout ? panelIdsInVisualOrder(selectedWorkspace.layout) : []),
-    [selectedWorkspace?.layout],
+    () => {
+      const layout = selectedWorkspace ? workspaceLayout(selectedWorkspace) : null;
+      return layout ? panelIdsInVisualOrder(layout) : [];
+    },
+    [selectedWorkspace],
   );
+
+  useEffect(() => {
+    // A slow terminal start must not pull the user back after leaving this map.
+    officeNavigation.current += 1;
+  }, [selectedArea?.id, workspaceView]);
 
   useEffect(() => {
     void refresh();
@@ -229,6 +248,21 @@ function App() {
   }, [selectedArea]);
 
   useEffect(() => {
+    if (!selectedArea || !selectedArea.workspaces.some(isTeamWorkspace)) return;
+    let disposed = false;
+    void terminalApi.prepareArea(selectedArea.id).then(() => {
+      if (!disposed) void refresh();
+    }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+    return () => { disposed = true; };
+  }, [selectedArea?.id, selectedArea?.rootPath]);
+
+  useEffect(() => {
+    const onFocus = () => { void refresh(); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  useEffect(() => {
     setFocusedPanelId((previous) =>
       previous && visiblePanelIds.includes(previous) ? previous : (visiblePanelIds[0] ?? null),
     );
@@ -283,9 +317,40 @@ function App() {
     }
   }
 
+  async function newManagerConversation(terminalId: string) {
+    if (pendingResets.current.has(terminalId)) return;
+    pendingResets.current.add(terminalId);
+    setResettingTerminalIds(new Set(pendingResets.current));
+    const requestId = resetRequestIds.current.get(terminalId) ?? crypto.randomUUID();
+    resetRequestIds.current.set(terminalId, requestId);
+    try {
+      applySnapshot(await terminalApi.resetAgentContext(terminalId, requestId));
+      resetRequestIds.current.delete(terminalId);
+    } catch (cause) {
+      // Retain the request id so a retry cannot reset twice after an uncertain reply.
+      setError(errorMessage(cause));
+    } finally {
+      pendingResets.current.delete(terminalId);
+      setResettingTerminalIds(new Set(pendingResets.current));
+    }
+  }
+
   function showMenu(event: React.MouseEvent, entries: MenuEntry[]) {
     event.preventDefault();
     setContextMenu({ x: event.clientX, y: event.clientY, entries });
+  }
+
+  async function openOfficeTerminal(workspaceId: string, terminalId: string) {
+    // Reuse the existing session; the terminal tree stays mounted behind the map.
+    const navigation = officeNavigation.current;
+    if (!activeIds.has(terminalId) || snapshot?.memberStates?.[terminalId]?.connected === false) {
+      applySnapshot(await terminalApi.startTerminal(terminalId));
+    }
+    if (navigation !== officeNavigation.current) return;
+    setSelectedWorkspaceId(workspaceId);
+    setFocusedPanelId(terminalId);
+    setMaximizedPanelId(terminalId);
+    setWorkspaceView("terminals");
   }
 
   function showMenuFromButton(event: React.MouseEvent<HTMLButtonElement>, entries: MenuEntry[]) {
@@ -305,14 +370,16 @@ function App() {
 
   async function createArea(event: React.FormEvent) {
     event.preventDefault();
-    await run(terminalApi.createArea({ name: areaName, rootPath: areaPath }));
+    await run(terminalApi.createArea({ name: areaName, rootPath: areaPath, workspaceKind: areaWorkspaceKind }));
     setAreaDialogOpen(false);
     setAreaName("");
     setAreaPath("");
+    setAreaWorkspaceKind("normal");
   }
 
   function openCreateWorkspaceDialog() {
     if (!selectedArea) return;
+    setNewWorkspaceKind("normal");
     openTextDialog({ kind: "create-workspace", areaId: selectedArea.id }, "Workspace novo");
   }
 
@@ -351,7 +418,12 @@ function App() {
       let next: AppSnapshot;
       switch (textDialog.kind) {
         case "create-workspace":
-          next = await terminalApi.createWorkspace({ areaId: textDialog.areaId, name: value });
+          next = await terminalApi.createWorkspace({ areaId: textDialog.areaId, name: value, kind: newWorkspaceKind });
+          {
+            const existing = new Set(snapshot?.areas.flatMap(a => a.workspaces).map(w => w.id));
+            const created = next.areas.find(a => a.id === textDialog.areaId)?.workspaces.find(w => !existing.has(w.id));
+            if (created) { setSelectedWorkspaceId(created.id); setWorkspaceView(isTeamWorkspace(created) ? "team" : "terminals"); }
+          }
           break;
         case "rename-area":
           next = await terminalApi.renameArea(textDialog.areaId, value);
@@ -708,6 +780,8 @@ function App() {
         {selectedArea ? (
           <header className="workspace-tabs" aria-label="Workspaces">
             <span className="area-path" title={selectedArea.rootPath}>{selectedArea.name}</span>
+            <button className="toolbar-secondary" onClick={() => setInstructionsArea({ id: selectedArea.id, name: selectedArea.name })}>Instruções da Área</button>
+            {selectedArea.workspaces.some(isTeamWorkspace) ? <button className="office-toggle" aria-pressed={workspaceView === "office"} title="Ver escritório da Área de Trabalho" onClick={() => setWorkspaceView(current => current === "office" ? "terminals" : "office")}>Escritório</button> : null}
             <div className="tabs" role="tablist" aria-label={`Workspaces de ${selectedArea.name}`}>
               {selectedArea.workspaces.map((workspace) => {
                 const tone = workspaceAgentTone(workspace, activeIds, agentStates);
@@ -727,38 +801,43 @@ function App() {
           <select id="profile-select" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>{snapshot.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.available ? "" : " — indisponível"}</option>)}</select>
           <button className="toolbar-secondary" title="Gerenciar perfis locais" aria-label="Gerenciar perfis" aria-haspopup="menu" onClick={(event) => showMenuFromButton(event, profilesMenu())}>Perfis</button>
           <button title="Adicionar novo terminal" onClick={() => void addTerminal()}>+ Terminal</button>
+          {isTeamWorkspace(selectedWorkspace) ? <button className={`toolbar-secondary ${workspaceView === "team" ? "is-active" : ""}`} aria-pressed={workspaceView === "team"} onClick={() => setWorkspaceView(current => current === "team" ? "terminals" : "team")}>{workspaceView === "team" ? "Voltar aos terminais" : "Equipe"}</button> : null}
           <button className={`toolbar-secondary summary-toggle ${workspaceView === "summary" ? "is-active" : ""}`} title={workspaceView === "summary" ? "Voltar aos terminais" : "Ver resumo da tarefa"} aria-pressed={workspaceView === "summary"} onClick={() => setWorkspaceView((current) => current === "summary" ? "terminals" : "summary")}>{workspaceView === "summary" ? "Terminais" : "Resumo"}</button>
           <span className={`task-status-dot agent-${workspaceAgentTone(selectedWorkspace, activeIds, agentStates)}`} title={`Agentes: ${AGENT_STATUS_LABELS[workspaceAgentTone(selectedWorkspace, activeIds, agentStates)]}`} aria-hidden="true" />
-          <span className="privacy-note">{workspaceView === "summary" ? "Resumo salvo somente neste dispositivo." : "Nada digitado ou exibido no terminal é salvo."}</span>
+          <span className="privacy-note">{workspaceView === "summary" ? "Resumo salvo somente neste dispositivo." : selectedWorkspace.panels.some(p => p.member) ? "Equipe local · sessões e histórico no Codex" : "Nada digitado ou exibido no terminal é salvo."}</span>
         </div> : null}
         <section
-          className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""} ${workspaceView === "summary" ? "is-hidden" : ""}`}
+          className={`terminal-stage ${maximizedPanelId ? "is-maximized" : ""} ${workspaceView !== "terminals" ? "is-hidden" : ""}`}
           aria-label={selectedWorkspace ? `Terminais de ${selectedWorkspace.name}` : "Terminais"}
-          aria-hidden={workspaceView === "summary" || !selectedWorkspace}
+          aria-hidden={workspaceView !== "terminals" || !selectedWorkspace}
           hidden={!selectedWorkspace}
         >
           {renderedWorkspaces.map((workspace) => {
             const isSelected = workspace.id === selectedWorkspace?.id;
+            const layout = workspaceLayout(workspace);
             return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
-              {workspace.layout ? <LayoutTree node={workspace.layout} panels={workspace.panels} activeIds={activeIds} agentStates={agentStates} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
+              {layout ? <LayoutTree memberStates={snapshot.memberStates} resettingTerminalIds={resettingTerminalIds} onNewConversation={id => void newManagerConversation(id)} node={layout} automatic={workspace.panels.some(panel => panel.member?.manager)} panels={workspace.panels} activeIds={activeIds} agentStates={agentStates} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
             </div>;
           })}
         </section>
         {selectedWorkspace ? <TaskSummary workspace={selectedWorkspace} activeIds={activeIds} agentStates={agentStates} visible={workspaceView === "summary"} /> : null}
+        {selectedWorkspace && isTeamWorkspace(selectedWorkspace) && workspaceView === "team" ? <TeamView key={selectedWorkspace.id} workspace={selectedWorkspace} snapshot={snapshot} onSnapshot={applySnapshot} onOpen={id => { setFocusedPanelId(id); setMaximizedPanelId(id); setWorkspaceView("terminals"); }} /> : null}
+        {selectedArea && workspaceView === "office" ? <OfficeView key={selectedArea.id} area={selectedArea} snapshot={snapshot} onOpen={openOfficeTerminal} onTeam={id => { setSelectedWorkspaceId(id); setWorkspaceView("team"); }} onClose={() => setWorkspaceView("terminals")} /> : null}
       </section>
 
       {error ? <div className="error-toast" role="alert">{error}<button title="Fechar mensagem" onClick={() => setError(null)}>×</button></div> : null}
       {contextMenu ? <ContextMenu menu={contextMenu} onClose={() => setContextMenu(null)} /> : null}
-      {areaDialogOpen ? <AreaDialog name={areaName} path={areaPath} onName={setAreaName} onPath={setAreaPath} onChoose={() => void chooseFolder(setAreaPath)} onClose={() => setAreaDialogOpen(false)} onSubmit={createArea} /> : null}
+      {areaDialogOpen ? <AreaDialog workspaceKind={areaWorkspaceKind} onWorkspaceKind={setAreaWorkspaceKind} name={areaName} path={areaPath} onName={setAreaName} onPath={setAreaPath} onChoose={() => void chooseFolder(setAreaPath)} onClose={() => setAreaDialogOpen(false)} onSubmit={createArea} /> : null}
+      {instructionsArea ? <AreaInstructions key={instructionsArea.id} areaId={instructionsArea.id} areaName={instructionsArea.name} onClose={() => setInstructionsArea(null)} onSaved={() => void refresh()} /> : null}
       {profileDialogOpen ? <ProfileDialog editing={configuredProfileId !== null} name={profileName} executable={profileExecutable} argumentsText={profileArguments} onName={setProfileName} onExecutable={setProfileExecutable} onArguments={setProfileArguments} onClose={closeProfileDialog} onSubmit={createProfile} /> : null}
-      {textDialog ? <TextEditDialog dialog={textDialog} value={textDialogValue} error={textDialogError} onValue={setTextDialogValue} onClose={closeTextDialog} onSubmit={saveTextDialog} /> : null}
+      {textDialog ? <TextEditDialog workspaceKind={newWorkspaceKind} onWorkspaceKind={setNewWorkspaceKind} dialog={textDialog} value={textDialogValue} error={textDialogError} onValue={setTextDialogValue} onClose={closeTextDialog} onSubmit={saveTextDialog} /> : null}
     </main>
   );
 }
 
 function TaskSummary({ workspace, activeIds, agentStates, visible }: { workspace: Workspace; activeIds: Set<string>; agentStates: Record<string, AgentState>; visible: boolean }) {
   const task = workspace.task ?? EMPTY_TASK;
-  const hasContext = Boolean(task.summary || task.current || task.next || task.blocker);
+  const hasContext = Boolean(task.summary || task.steps?.length || task.current || task.next || task.blocker);
   const agents = workspace.panels.map((panel) => {
     const tone = agentTone(panel.id, activeIds, agentStates);
     return { panel, tone, state: agentStates[panel.id] };
@@ -786,7 +865,17 @@ function TaskSummary({ workspace, activeIds, agentStates, visible }: { workspace
           <div className="task-summary-grid">
             <article className="task-summary-card task-summary-overview">
               <span>Resumo atual</span>
-              <p>{task.summary || "O agente ainda não registrou um resumo."}</p>
+              <TaskMarkdown content={task.summary || "O agente ainda não registrou um resumo."} />
+              {task.steps?.length ? <div className="task-summary-steps">
+                <h2>Etapas</h2>
+                <ol aria-label="Etapas da tarefa">
+                  {task.steps.map((step, index) => <li key={step.id}>
+                    <span className="step-number" aria-hidden="true">{index + 1}</span>
+                    <span className="step-title">{step.title}</span>
+                    <span className={`task-status status-${step.status}`}>{TASK_STATUS_LABELS[step.status]}</span>
+                  </li>)}
+                </ol>
+              </div> : null}
             </article>
             <article className="task-summary-card">
               <span>Em execução</span>
@@ -805,7 +894,7 @@ function TaskSummary({ workspace, activeIds, agentStates, visible }: { workspace
           <div className="task-summary-empty">
             <span aria-hidden="true">◎</span>
             <h2>Aguardando contexto da tarefa</h2>
-            <p>O agente deste Workspace publicará aqui o andamento, o próximo passo e eventuais bloqueios.</p>
+            <p>O agente publicará o objetivo de cada tarefa, o que foi implementado, os testes, as pendências e os links de acompanhamento.</p>
           </div>
         )}
 
@@ -842,6 +931,7 @@ function TaskSummary({ workspace, activeIds, agentStates, visible }: { workspace
 }
 
 type LayoutTreeProps = {
+  automatic: boolean;
   node: LayoutNode;
   panels: TerminalPanelModel[];
   activeIds: Set<string>;
@@ -851,6 +941,9 @@ type LayoutTreeProps = {
   pendingSplitRatios: Record<string, number>;
   onStart: (id: string) => void;
   onStop: (id: string) => void;
+  onNewConversation: (id: string) => void;
+  resettingTerminalIds: Set<string>;
+  memberStates: AppSnapshot["memberStates"];
   onClose: (id: string) => void;
   onSplit: (id: string, direction: SplitDirection) => void;
   onFocus: (id: string) => void;
@@ -860,29 +953,62 @@ type LayoutTreeProps = {
   onContextMenu: (event: React.MouseEvent, id: string) => void;
 };
 
-function LayoutTree({ node, panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
-  if (node.kind === "panel") {
-    const panel = panels.find((item) => item.id === node.panelId);
-    return panel ? <TerminalPanel panel={panel} active={activeIds.has(panel.id)} agentStatus={agentStates[panel.id]?.status} focused={focusedPanelId === panel.id} maximized={maximizedPanelId === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} /> : null;
-  }
-  const ratio = clampRatio(pendingSplitRatios[node.id] ?? node.ratio);
-  const firstMaximized = Boolean(maximizedPanelId && containsPanel(node.first, maximizedPanelId));
-  const secondMaximized = Boolean(maximizedPanelId && containsPanel(node.second, maximizedPanelId));
-  const showFirst = !maximizedPanelId || firstMaximized;
-  const showSecond = !maximizedPanelId || secondMaximized;
-  const bothVisible = showFirst && showSecond;
-  const gridStyle = node.direction === "vertical"
-    ? { gridTemplateColumns: bothVisible ? `minmax(0, ${ratio}fr) 9px minmax(0, ${1 - ratio}fr)` : "minmax(0, 1fr)" }
-    : { gridTemplateRows: bothVisible ? `minmax(0, ${ratio}fr) 9px minmax(0, ${1 - ratio}fr)` : "minmax(0, 1fr)" };
-  const childProps = { panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu };
-  return <div className={`terminal-split ${node.direction}`} style={gridStyle}>
-    <div className={`layout-branch ${showFirst ? "" : "is-hidden"}`}><LayoutTree node={node.first} {...childProps} /></div>
-    {bothVisible ? <SplitDivider splitId={node.id} direction={node.direction} ratio={ratio} onChange={onRatioChange} onCommit={onRatioCommit} /> : null}
-    <div className={`layout-branch ${showSecond ? "" : "is-hidden"}`}><LayoutTree node={node.second} {...childProps} /></div>
-  </div>;
+// Positions are affine lengths: a percentage of the workspace plus a pixel
+// offset for the dividers. Only geometry follows the split tree; terminal DOM
+// nodes remain siblings with stable keys throughout splits and collapses.
+type LayoutLength = { percent: number; pixels: number };
+type LayoutRect = { left: LayoutLength; top: LayoutLength; width: LayoutLength; height: LayoutLength };
+const FULL_LAYOUT_RECT: LayoutRect = {
+  left: { percent: 0, pixels: 0 }, top: { percent: 0, pixels: 0 },
+  width: { percent: 100, pixels: 0 }, height: { percent: 100, pixels: 0 },
+};
+const DIVIDER_SIZE = 9;
+
+function rectStyle(rect: LayoutRect): CSSProperties {
+  const length = ({ percent, pixels }: LayoutLength) => `calc(${percent}% ${pixels < 0 ? "-" : "+"} ${Math.abs(pixels)}px)`;
+  return { position: "absolute", left: length(rect.left), top: length(rect.top), width: length(rect.width), height: length(rect.height) };
 }
 
-function SplitDivider({ splitId, direction, ratio, onChange, onCommit }: { splitId: string; direction: SplitDirection; ratio: number; onChange: (splitId: string, ratio: number) => void; onCommit: (splitId: string, ratio: number) => void }) {
+function LayoutTree({ memberStates, resettingTerminalIds, onNewConversation, node, automatic, panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
+  const positions = new Map<string, CSSProperties>();
+  const dividers: { node: Extract<LayoutNode, { kind: "split" }>; ratio: number; region: CSSProperties; style: CSSProperties }[] = [];
+  const visit = (current: LayoutNode, rect: LayoutRect) => {
+    if (current.kind === "panel") {
+      positions.set(current.panelId, rectStyle(rect));
+      return;
+    }
+    const ratio = automatic ? current.ratio : clampRatio(pendingSplitRatios[current.id] ?? current.ratio);
+    const vertical = current.direction === "vertical";
+    const axis = vertical ? "left" : "top";
+    const size = vertical ? "width" : "height";
+    const available = { ...rect[size], pixels: rect[size].pixels - DIVIDER_SIZE };
+    const firstSize = { percent: available.percent * ratio, pixels: available.pixels * ratio };
+    const secondSize = { percent: available.percent * (1 - ratio), pixels: available.pixels * (1 - ratio) };
+    const secondStart = { percent: rect[axis].percent + firstSize.percent, pixels: rect[axis].pixels + firstSize.pixels + DIVIDER_SIZE };
+    dividers.push({ node: current, ratio, region: rectStyle(rect), style: {
+      position: "absolute", [axis]: `calc(${ratio * 100}% - ${DIVIDER_SIZE * ratio}px)`,
+      [size]: DIVIDER_SIZE, [vertical ? "top" : "left"]: 0, [vertical ? "height" : "width"]: "100%",
+    } });
+    visit(current.first, { ...rect, [size]: firstSize });
+    visit(current.second, { ...rect, [axis]: secondStart, [size]: secondSize });
+  };
+  visit(node, FULL_LAYOUT_RECT);
+  const maximized = maximizedPanelId && positions.has(maximizedPanelId) ? maximizedPanelId : null;
+  return <>
+    {[...panels].sort((a, b) => a.id.localeCompare(b.id)).map((panel) => {
+      const visible = positions.has(panel.id) && (!maximized || maximized === panel.id);
+      const style = visible ? (maximized ? rectStyle(FULL_LAYOUT_RECT) : positions.get(panel.id)) : { display: "none" };
+      const runtime = memberStates?.[panel.id];
+      const newConversationDisabled = resettingTerminalIds.has(panel.id) || !!panel.member?.paused || !!runtime?.turnId || !!runtime?.request || !!panel.member?.jobs.some(job => job.status === "running" || job.status === "uncertain");
+      return <TerminalPanel onNewConversation={onNewConversation} newConversationDisabled={newConversationDisabled} key={panel.id} style={style} panel={panel} active={activeIds.has(panel.id)} agentStatus={agentStates[panel.id]?.status} focused={focusedPanelId === panel.id} maximized={maximized === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} />;
+    })}
+    {!maximized && !automatic && dividers.map(({ node: split, ratio, region, style }) => <div key={split.id} className="terminal-divider-region" style={region}>
+      <SplitDivider splitId={split.id} direction={split.direction} ratio={ratio} style={style} onChange={onRatioChange} onCommit={onRatioCommit} />
+    </div>)}
+  </>;
+}
+
+function SplitDivider({ splitId, direction, ratio, style, onChange, onCommit }: { style: CSSProperties; splitId: string; direction: SplitDirection; ratio: number; onChange: (splitId: string, ratio: number) => void; onCommit: (splitId: string, ratio: number) => void }) {
   const latestRatio = useRef(ratio);
 
   useEffect(() => {
@@ -930,14 +1056,14 @@ function SplitDivider({ splitId, direction, ratio, onChange, onCommit }: { split
     window.addEventListener("pointerup", finish, { once: true });
   };
 
-  return <div className={`split-divider ${direction}`} role="separator" tabIndex={0} aria-orientation={vertical ? "vertical" : "horizontal"} aria-valuemin={15} aria-valuemax={85} aria-valuenow={Math.round(ratio * 100)} aria-label={`Ajustar divisão ${vertical ? "vertical" : "horizontal"}`} title="Arraste para ajustar. Use setas, Home ou End pelo teclado." onKeyDown={adjustFromKeyboard} onPointerDown={startDragging} />;
+  return <div className={`split-divider ${direction}`} style={style} role="separator" tabIndex={0} aria-orientation={vertical ? "vertical" : "horizontal"} aria-valuemin={15} aria-valuemax={85} aria-valuenow={Math.round(ratio * 100)} aria-label={`Ajustar divisão ${vertical ? "vertical" : "horizontal"}`} title="Arraste para ajustar. Use setas, Home ou End pelo teclado." onKeyDown={adjustFromKeyboard} onPointerDown={startDragging} />;
 }
 
 function ContextMenu({ menu, onClose }: { menu: NonNullable<ContextMenuState>; onClose: () => void }) {
   return <div className="context-menu" role="menu" style={{ left: menu.x, top: menu.y }} onClick={(event) => event.stopPropagation()}>{menu.entries.map((entry) => <button role="menuitem" key={entry.label} title={entry.description} onClick={() => { onClose(); entry.action(); }}><strong>{entry.label}</strong><small>{entry.description}</small></button>)}</div>;
 }
 
-function TextEditDialog({ dialog, value, error, onValue, onClose, onSubmit }: { dialog: TextDialogState; value: string; error: string | null; onValue: (value: string) => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
+function TextEditDialog({ workspaceKind, onWorkspaceKind, dialog, value, error, onValue, onClose, onSubmit }: { workspaceKind: WorkspaceKind; onWorkspaceKind: (kind: WorkspaceKind) => void; dialog: TextDialogState; value: string; error: string | null; onValue: (value: string) => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
   const dialogRef = useRef<HTMLFormElement>(null);
   const isLabel = dialog.kind === "terminal-label";
   const copy = isLabel
@@ -991,11 +1117,15 @@ function TextEditDialog({ dialog, value, error, onValue, onClose, onSubmit }: { 
     };
   }, []);
 
-  return <div className="modal-backdrop"><form ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="text-edit-dialog-title" onSubmit={onSubmit}><header><h2 id="text-edit-dialog-title">{copy.title}</h2><button type="button" title="Fechar" aria-label="Fechar" onClick={onClose}>×</button></header><label htmlFor="text-edit-dialog-value">{copy.field}</label><input id="text-edit-dialog-value" required={!isLabel} maxLength={isLabel ? 32 : 120} value={value} onChange={(event) => onValue(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? "text-edit-dialog-hint text-edit-dialog-error" : "text-edit-dialog-hint"} autoFocus /><p id="text-edit-dialog-hint">{copy.hint}</p>{error ? <p className="form-error" id="text-edit-dialog-error" role="alert">{error}</p> : null}<footer><button type="button" title="Cancelar edição" onClick={onClose}>Cancelar</button><button type="submit" title={copy.submit} disabled={!isLabel && !value.trim()}>{copy.submit}</button></footer></form></div>;
+  return <div className="modal-backdrop"><form ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="text-edit-dialog-title" onSubmit={onSubmit}><header><h2 id="text-edit-dialog-title">{copy.title}</h2><button type="button" title="Fechar" aria-label="Fechar" onClick={onClose}>×</button></header><label htmlFor="text-edit-dialog-value">{copy.field}</label><input id="text-edit-dialog-value" required={!isLabel} maxLength={isLabel ? 32 : 120} value={value} onChange={(event) => onValue(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? "text-edit-dialog-hint text-edit-dialog-error" : "text-edit-dialog-hint"} autoFocus />{dialog.kind === "create-workspace" ? <WorkspaceKindField value={workspaceKind} onChange={onWorkspaceKind} /> : null}<p id="text-edit-dialog-hint">{copy.hint}</p>{error ? <p className="form-error" id="text-edit-dialog-error" role="alert">{error}</p> : null}<footer><button type="button" title="Cancelar edição" onClick={onClose}>Cancelar</button><button type="submit" title={copy.submit} disabled={!isLabel && !value.trim()}>{copy.submit}</button></footer></form></div>;
 }
 
-function AreaDialog({ name, path, onName, onPath, onChoose, onClose, onSubmit }: { name: string; path: string; onName: (value: string) => void; onPath: (value: string) => void; onChoose: () => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
-  return <div className="modal-backdrop"><form className="modal" role="dialog" aria-modal="true" aria-labelledby="area-dialog-title" onSubmit={onSubmit}><header><h2 id="area-dialog-title">Nova área de trabalho</h2><button type="button" title="Fechar" aria-label="Fechar" onClick={onClose}>×</button></header><label htmlFor="area-name">Nome</label><input id="area-name" required value={name} onChange={(event) => onName(event.target.value)} placeholder="Ex.: Plataforma Kanasha" autoFocus /><label htmlFor="area-path">Pasta-raiz local</label><div className="path-field"><input id="area-path" required value={path} onChange={(event) => onPath(event.target.value)} placeholder="/caminho/para/projetos" /><button type="button" title="Selecionar pasta local" onClick={onChoose}>Escolher…</button></div><p>Essa ação nunca altera os arquivos da pasta selecionada.</p><footer><button type="button" title="Cancelar criação da área" onClick={onClose}>Cancelar</button><button type="submit" title="Criar área de trabalho">Criar área</button></footer></form></div>;
+function WorkspaceKindField({ value, onChange, label = "Tipo de workspace" }: { value: WorkspaceKind; onChange: (kind: WorkspaceKind) => void; label?: string }) {
+  return <><label htmlFor="workspace-kind">{label}</label><select id="workspace-kind" value={value} onChange={event => onChange(event.target.value as WorkspaceKind)}><option value="normal">Organização normal</option><option value="team">Equipe</option></select><p>{value === "normal" ? "Organize terminais livremente, sem gerente ou contratação." : "Comece com um gerente e contrate membros na tela Equipe."}</p></>;
+}
+
+function AreaDialog({ workspaceKind, onWorkspaceKind, name, path, onName, onPath, onChoose, onClose, onSubmit }: { workspaceKind: WorkspaceKind; onWorkspaceKind: (kind: WorkspaceKind) => void; name: string; path: string; onName: (value: string) => void; onPath: (value: string) => void; onChoose: () => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
+  return <div className="modal-backdrop"><form className="modal" role="dialog" aria-modal="true" aria-labelledby="area-dialog-title" onSubmit={onSubmit}><header><h2 id="area-dialog-title">Nova área de trabalho</h2><button type="button" title="Fechar" aria-label="Fechar" onClick={onClose}>×</button></header><label htmlFor="area-name">Nome</label><input id="area-name" required value={name} onChange={(event) => onName(event.target.value)} placeholder="Ex.: Plataforma Kanasha" autoFocus /><label htmlFor="area-path">Pasta-raiz local</label><div className="path-field"><input id="area-path" required value={path} onChange={(event) => onPath(event.target.value)} placeholder="/caminho/para/projetos" /><button type="button" title="Selecionar pasta local" onClick={onChoose}>Escolher…</button></div><WorkspaceKindField value={workspaceKind} onChange={onWorkspaceKind} label="Tipo do primeiro workspace" /><footer><button type="button" title="Cancelar criação da área" onClick={onClose}>Cancelar</button><button type="submit" title="Criar área de trabalho">Criar área</button></footer></form></div>;
 }
 
 function ProfileDialog({ editing, name, executable, argumentsText, onName, onExecutable, onArguments, onClose, onSubmit }: { editing: boolean; name: string; executable: string; argumentsText: string; onName: (value: string) => void; onExecutable: (value: string) => void; onArguments: (value: string) => void; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {

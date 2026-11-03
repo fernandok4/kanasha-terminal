@@ -5,6 +5,49 @@ use std::{
     thread,
 };
 
+// A PTY read is an arbitrary byte boundary, including the middle of a UTF-8
+// character. Keep incomplete characters for the next read so they occupy the
+// same number of terminal cells as the application intended.
+#[derive(Default)]
+struct OutputDecoder {
+    pending: Vec<u8>,
+}
+
+impl OutputDecoder {
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut output = String::new();
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(text) => {
+                    output.push_str(text);
+                    consumed = self.pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    output
+                        .push_str(std::str::from_utf8(&self.pending[consumed..valid_end]).unwrap());
+                    consumed = valid_end;
+                    match error.error_len() {
+                        Some(length) => {
+                            output.push('\u{fffd}');
+                            consumed += length;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+
+    fn finish(self) -> String {
+        String::from_utf8_lossy(&self.pending).into_owned()
+    }
+}
+
 pub struct PtySession {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -90,11 +133,21 @@ where
 
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let mut decoder = OutputDecoder::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
-                Ok(size) => on_output(String::from_utf8_lossy(&buffer[..size]).into_owned()),
+                Ok(size) => {
+                    let output = decoder.decode(&buffer[..size]);
+                    if !output.is_empty() {
+                        on_output(output);
+                    }
+                }
             }
+        }
+        let remaining = decoder.finish();
+        if !remaining.is_empty() {
+            on_output(remaining);
         }
         on_exit();
     });
@@ -113,6 +166,36 @@ mod tests {
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn output_preserves_utf8_and_cursor_commands_at_every_read_boundary() {
+        let expected = "\x1b[2J\x1b[3;5HCorreção: ação, 日本語, 🦀\r\n\x1b[4Cfim";
+        for boundary in 0..=expected.len() {
+            let mut decoder = OutputDecoder::default();
+            let mut actual = decoder.decode(&expected.as_bytes()[..boundary]);
+            actual.push_str(&decoder.decode(&expected.as_bytes()[boundary..]));
+            actual.push_str(&decoder.finish());
+            assert_eq!(actual, expected, "boundary {boundary}");
+        }
+        let mut decoder = OutputDecoder::default();
+        let actual: String = expected
+            .as_bytes()
+            .iter()
+            .map(|byte| decoder.decode(&[*byte]))
+            .collect();
+        assert_eq!(actual + &decoder.finish(), expected);
+    }
+
+    #[test]
+    fn invalid_utf8_and_incomplete_eof_do_not_discard_following_output() {
+        let mut decoder = OutputDecoder::default();
+        assert_eq!(decoder.decode(b"a\xff\x1b[2J\xf0\x9f"), "a\u{fffd}\x1b[2J");
+        assert_eq!(decoder.decode(b"\xa6"), "");
+        assert_eq!(decoder.finish(), "\u{fffd}");
+        let mut decoder = OutputDecoder::default();
+        assert_eq!(decoder.decode(b"\xc3"), "");
+        assert_eq!(decoder.decode(b"\r\nnext"), "\u{fffd}\r\nnext");
+    }
 
     #[cfg(unix)]
     #[test]

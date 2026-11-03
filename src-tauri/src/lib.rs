@@ -1,5 +1,15 @@
+use crate::models::{OfficeTask, TaskState};
+mod area_instructions;
+mod codex;
+mod deliveries;
+mod delivery_git;
+mod execution;
+mod learning;
 mod mcp;
 mod models;
+mod office;
+mod soul;
+mod tasks;
 mod terminal;
 
 use crate::{
@@ -7,13 +17,13 @@ use crate::{
         new_id, AgentState, AppSnapshot, Area, ConfigureProfileInput, CreateAreaInput,
         CreateTerminalInput, CreateWorkspaceInput, PersistedProfile, PersistedState, ProfileView,
         ReorderDirection, ResizeTerminalInput, SetSplitRatioInput, SetTerminalLabelInput,
-        SplitDirection, TaskContext, TaskPatch, TaskState, TerminalExit, TerminalOutput,
+        SplitDirection, TaskContext, TaskPatch, TaskStep, TerminalExit, TerminalOutput,
         TerminalPanel, Workspace,
     },
     terminal::{start_pty, PtySession},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -45,6 +55,11 @@ pub struct AppState {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     agent_states: Arc<Mutex<HashMap<String, AgentState>>>,
     runtime_profiles: Arc<Mutex<HashMap<String, RuntimeProfile>>>,
+    office_sessions: Arc<Mutex<HashMap<String, Arc<codex::CodexSession>>>>,
+    member_states: Arc<Mutex<HashMap<String, models::MemberRuntime>>>,
+    office_gate: Arc<Mutex<()>>,
+    terminal_gate: Arc<Mutex<()>>,
+    member_tokens: Arc<Mutex<HashMap<String, String>>>,
     mcp_socket_path: PathBuf,
     mcp_token: String,
 }
@@ -66,6 +81,31 @@ impl AppState {
             }
         };
         persisted.version = 3;
+        // Older files have no kind; existing members identify an established team.
+        for workspace in persisted.areas.iter_mut().flat_map(|a| &mut a.workspaces) {
+            if workspace.panels.iter().any(|p| p.member.is_some()) {
+                workspace.kind = models::WorkspaceKind::Team;
+            }
+        }
+        for panel in persisted
+            .areas
+            .iter_mut()
+            .flat_map(|a| &mut a.workspaces)
+            .flat_map(|w| &mut w.panels)
+        {
+            if let Some(member) = &mut panel.member {
+                // Legacy settings default to Sol; preserve any model explicitly saved by the user.
+                if member.manager {
+                    member.execution.level = "manager".into();
+                }
+                for job in &mut member.jobs {
+                    if matches!(job.status, models::AssignmentStatus::Running) {
+                        job.status = models::AssignmentStatus::Uncertain;
+                        job.result = "O aplicativo foi encerrado durante esta execução. Confira o histórico da sessão antes de atribuir novamente.".into();
+                    }
+                }
+            }
+        }
         let mcp_socket_path = state_path
             .parent()
             .ok_or("O local da configuração é inválido.")?
@@ -76,6 +116,11 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             agent_states: Arc::new(Mutex::new(HashMap::new())),
             runtime_profiles: Arc::new(Mutex::new(HashMap::new())),
+            office_sessions: Arc::new(Mutex::new(HashMap::new())),
+            member_states: Arc::new(Mutex::new(HashMap::new())),
+            office_gate: Arc::new(Mutex::new(())),
+            terminal_gate: Arc::new(Mutex::new(())),
+            member_tokens: Arc::new(Mutex::new(HashMap::new())),
             mcp_socket_path,
             mcp_token: new_id(),
         })
@@ -87,29 +132,52 @@ impl AppState {
         let profiles = profile_views(&persisted, &runtime_profiles);
         let active_terminal_ids = guard(&self.sessions)?.keys().cloned().collect();
         let agent_states = guard(&self.agent_states)?.clone();
+        let mut member_states = guard(&self.member_states)?.clone();
+        for area in &persisted.areas {
+            if !area
+                .workspaces
+                .iter()
+                .flat_map(|w| &w.panels)
+                .any(|p| member_states.contains_key(&p.id))
+            {
+                continue;
+            }
+            let document = area_instructions::read(Path::new(&area.root_path));
+            for panel in area.workspaces.iter().flat_map(|w| &w.panels) {
+                if let Some(runtime) = member_states.get_mut(&panel.id) {
+                    runtime.instructions_error = document.as_ref().err().cloned();
+                    runtime.instructions_pending = runtime.connected
+                        && document
+                            .as_ref()
+                            .map(|doc| {
+                                runtime.instructions_revision.as_ref() != Some(&doc.revision)
+                            })
+                            .unwrap_or(true);
+                }
+            }
+        }
         Ok(AppSnapshot {
             areas: persisted.areas.clone(),
             profiles,
             active_terminal_ids,
             agent_states,
+            member_states,
         })
     }
 
     fn create_area(&self, input: CreateAreaInput) -> Result<AppSnapshot, String> {
+        let _gate = guard(&self.office_gate)?;
         let mut persisted = guard(&self.persisted)?;
         let name = name(&input.name, "área")?;
         let root_path = directory(&input.root_path)?;
+        if input.workspace_kind == models::WorkspaceKind::Team {
+            area_instructions::prepare(Path::new(&root_path))?;
+        }
         persisted.areas.push(Area {
             id: new_id(),
             name,
             root_path,
-            workspaces: vec![Workspace {
-                id: new_id(),
-                name: "Workspace 1".to_string(),
-                task: TaskState::default(),
-                panels: Vec::new(),
-                layout: None,
-            }],
+            workspaces: vec![Workspace::new("Workspace 1".into(), input.workspace_kind)],
         });
         self.save(&persisted)?;
         drop(persisted);
@@ -125,8 +193,21 @@ impl AppState {
     }
 
     fn change_area_root(&self, area_id: &str, path: &str) -> Result<AppSnapshot, String> {
+        let _gate = guard(&self.office_gate)?;
         let mut persisted = guard(&self.persisted)?;
-        find_area_mut(&mut persisted, area_id)?.root_path = directory(path)?;
+        let area = find_area_mut(&mut persisted, area_id)?;
+        if area.workspaces.iter().flat_map(|w| &w.panels).any(|p| {
+            guard(&self.sessions).is_ok_and(|s| s.contains_key(&p.id))
+                || guard(&self.office_sessions).is_ok_and(|s| s.contains_key(&p.id))
+        }) {
+            return Err(
+                "Encerre os terminais da área antes de mudar a pasta-raiz e suas instruções."
+                    .into(),
+            );
+        }
+        let root_path = directory(path)?;
+        area_instructions::prepare(Path::new(&root_path))?;
+        area.root_path = root_path;
         self.save(&persisted)?;
         drop(persisted);
         self.snapshot()
@@ -160,15 +241,13 @@ impl AppState {
 
     fn create_workspace(&self, input: CreateWorkspaceInput) -> Result<AppSnapshot, String> {
         let mut persisted = guard(&self.persisted)?;
-        find_area_mut(&mut persisted, &input.area_id)?
-            .workspaces
-            .push(Workspace {
-                id: new_id(),
-                name: name(&input.name, "workspace")?,
-                task: TaskState::default(),
-                panels: Vec::new(),
-                layout: None,
-            });
+        let workspace_name = name(&input.name, "workspace")?;
+        let area = find_area_mut(&mut persisted, &input.area_id)?;
+        if input.kind == models::WorkspaceKind::Team {
+            area_instructions::prepare(Path::new(&area.root_path))?;
+        }
+        area.workspaces
+            .push(Workspace::new(workspace_name, input.kind));
         self.save(&persisted)?;
         drop(persisted);
         self.snapshot()
@@ -250,6 +329,7 @@ impl AppState {
             },
             label: None,
             profile_id: input.profile_id,
+            member: None,
         };
         let mut persisted = guard(&self.persisted)?;
         find_workspace_mut(&mut persisted, &input.workspace_id)?.add_panel(
@@ -263,10 +343,24 @@ impl AppState {
     }
 
     fn remove_terminal(&self, terminal_id: &str) -> Result<AppSnapshot, String> {
+        let _gate = guard(&self.office_gate)?;
         self.require_inactive(&[terminal_id.to_string()])?;
         let mut persisted = guard(&self.persisted)?;
         for area in &mut persisted.areas {
             for workspace in &mut area.workspaces {
+                if workspace
+                    .panel(terminal_id)
+                    .and_then(|p| p.member.as_ref())
+                    .is_some_and(|m| m.manager)
+                    && workspace
+                        .panels
+                        .iter()
+                        .filter(|p| p.member.is_some())
+                        .count()
+                        > 1
+                {
+                    return Err("Retire os membros da equipe antes de retirar o gerente.".into());
+                }
                 if workspace.remove_panel(terminal_id) {
                     self.save(&persisted)?;
                     drop(persisted);
@@ -316,6 +410,20 @@ impl AppState {
         terminal_id: &str,
         patch: Option<TaskPatch>,
     ) -> Result<TaskContext, String> {
+        self.task_context_for(workspace_id, terminal_id, None, patch)
+    }
+
+    fn task_context_for(
+        &self,
+        workspace_id: &str,
+        terminal_id: &str,
+        task_code: Option<&str>,
+        patch: Option<TaskPatch>,
+    ) -> Result<TaskContext, String> {
+        let task_code = task_code
+            .map(|code| office::task_code(code.to_owned()))
+            .transpose()?;
+        let task_code = task_code.as_deref();
         let patch = patch.filter(|patch| !patch.is_empty());
         {
             let persisted = guard(&self.persisted)?;
@@ -323,10 +431,31 @@ impl AppState {
             if workspace.panel(terminal_id).is_none() {
                 return Err("O agente não pertence a este Workspace.".to_string());
             }
+            if task_code.is_some()
+                && patch.as_ref().is_some_and(TaskPatch::has_task_changes)
+                && !workspace
+                    .panel(terminal_id)
+                    .and_then(|p| p.member.as_ref())
+                    .is_some_and(|member| {
+                        member.manager && member.training == models::TrainingState::Ready
+                    })
+            {
+                return Err(
+                    "Somente o gerente treinado atualiza as tarefas Jira da equipe.".into(),
+                );
+            }
+            if patch.as_ref().is_some_and(TaskPatch::has_task_changes)
+                && workspace
+                    .panel(terminal_id)
+                    .and_then(|p| p.member.as_ref())
+                    .is_some_and(|m| !m.manager)
+            {
+                return Err("Somente o gerente atualiza a tarefa compartilhada. Informe sua atividade com agentStatus e agentCurrent.".into());
+            }
         }
         let Some(patch) = patch else {
             let task = guard(&self.persisted)?;
-            let task = find_workspace(&task, workspace_id)?.task.clone();
+            let task = selected_task(find_workspace(&task, workspace_id)?, task_code)?.clone();
             let agent = guard(&self.agent_states)?
                 .get(terminal_id)
                 .cloned()
@@ -336,7 +465,16 @@ impl AppState {
         let summary = patch
             .summary
             .clone()
-            .map(|value| task_text(value, 800, "resumo"))
+            .map(|value| task_text(value, 8000, "resumo"))
+            .transpose()?;
+        let steps = patch.steps.clone().map(task_steps).transpose()?;
+        let step_status = patch
+            .step_status
+            .clone()
+            .map(|mut update| {
+                update.id = task_step_id(update.id)?;
+                Ok::<_, String>(update)
+            })
             .transpose()?;
         let current = patch
             .current
@@ -364,30 +502,117 @@ impl AppState {
 
         let task = if task_changed {
             let mut persisted = guard(&self.persisted)?;
-            let workspace = find_workspace_mut(&mut persisted, workspace_id)?;
+            let mut candidate = persisted.clone();
+            let workspace = find_workspace_mut(&mut candidate, workspace_id)?;
+            let mut updated = selected_task(workspace, task_code)
+                .cloned()
+                .or_else(|error| {
+                    if task_code.is_some() {
+                        Ok(TaskState::default())
+                    } else {
+                        Err(error)
+                    }
+                })?;
             if let Some(status) = patch.status.clone() {
-                workspace.task.status = status;
+                updated.status = status;
             }
             if let Some(summary) = summary {
-                workspace.task.summary = summary;
+                updated.summary = summary;
+            }
+            if let Some(steps) = steps {
+                if let Some(code) = task_code {
+                    for panel in &workspace.panels {
+                        if let Some(member) = &panel.member {
+                            if member
+                                .jobs
+                                .iter()
+                                .filter(|job| job.task_code.as_deref() == Some(code))
+                                .flat_map(|job| &job.step_ids)
+                                .any(|id| !steps.iter().any(|step| &step.id == id))
+                            {
+                                return Err("Preserve os IDs de etapas vinculadas a atribuições; seus títulos e status podem ser atualizados.".into());
+                            }
+                        }
+                    }
+                }
+                updated.steps = steps;
+            }
+            if let Some(step_status) = step_status {
+                let step = updated
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_status.id)
+                    .ok_or_else(|| "A etapa informada não existe nesta tarefa.".to_string())?;
+                step.status = step_status.status;
             }
             if let Some(current) = current {
-                workspace.task.current = current;
+                updated.current = current;
             }
             if let Some(next) = next {
-                workspace.task.next = next;
+                updated.next = next;
             }
             if let Some(blocker) = blocker {
-                workspace.task.blocker = blocker;
+                updated.blocker = blocker;
             }
-            workspace.task.revision = workspace.task.revision.saturating_add(1);
-            workspace.task.updated_at = updated_at;
-            let task = workspace.task.clone();
-            self.save(&persisted)?;
-            task
+            if let Some(code) = task_code {
+                if updated.status == models::TaskStatus::Done {
+                    if updated
+                        .steps
+                        .iter()
+                        .any(|step| step.status != models::TaskStatus::Done)
+                    {
+                        return Err(
+                            "Conclua os steps da tarefa antes de marcar a tarefa como concluída."
+                                .into(),
+                        );
+                    }
+                    if workspace
+                        .panels
+                        .iter()
+                        .filter_map(|p| p.member.as_ref())
+                        .filter(|m| !m.manager)
+                        .flat_map(|m| &m.jobs)
+                        .any(|job| {
+                            job.task_code.as_deref() == Some(code)
+                                && matches!(
+                                    job.status,
+                                    models::AssignmentStatus::Queued
+                                        | models::AssignmentStatus::Running
+                                        | models::AssignmentStatus::Uncertain
+                                )
+                        })
+                    {
+                        return Err("Conclua ou resolva as atribuições pendentes desta tarefa antes de liberar a próxima.".into());
+                    }
+                }
+            }
+            updated.revision = updated.revision.saturating_add(1);
+            updated.updated_at = updated_at;
+            if let Some(code) = task_code {
+                if updated.status == models::TaskStatus::Done {
+                    for panel in &mut workspace.panels {
+                        if let Some(member) = &mut panel.member {
+                            member.task_queue.retain(|item| item != code);
+                        }
+                    }
+                }
+                if let Some(task) = workspace.tasks.iter_mut().find(|t| t.task_code == code) {
+                    task.state = updated.clone();
+                } else {
+                    workspace.tasks.push(OfficeTask {
+                        task_code: code.into(),
+                        state: updated.clone(),
+                    });
+                }
+            } else {
+                workspace.task = updated.clone();
+            }
+            self.save(&candidate)?;
+            *persisted = candidate;
+            updated
         } else {
             let persisted = guard(&self.persisted)?;
-            find_workspace(&persisted, workspace_id)?.task.clone()
+            selected_task(find_workspace(&persisted, workspace_id)?, task_code)?.clone()
         };
         let agent = if agent_changed {
             let mut states = guard(&self.agent_states)?;
@@ -411,6 +636,43 @@ impl AppState {
     }
 
     fn start_terminal(&self, app: AppHandle, terminal_id: &str) -> Result<AppSnapshot, String> {
+        self.start_terminal_with_mode(app, terminal_id, true)
+    }
+
+    fn start_terminal_with_mode(
+        &self,
+        app: AppHandle,
+        terminal_id: &str,
+        resume_by_user: bool,
+    ) -> Result<AppSnapshot, String> {
+        let _terminal_gate = guard(&self.terminal_gate)?;
+        let is_member = {
+            let mut persisted = guard(&self.persisted)?;
+            let panel = find_terminal_mut(&mut persisted, terminal_id)?;
+            if let Some(member) = &mut panel.member {
+                if member.paused && !resume_by_user {
+                    return Err("Esta pessoa foi interrompida pelo usuário.".into());
+                }
+                if resume_by_user {
+                    member.paused = false;
+                    self.save(&persisted)?;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if is_member
+            && guard(&self.member_states)?
+                .get(terminal_id)
+                .is_some_and(|s| !s.connected)
+        {
+            if let Some(mut session) = guard(&self.sessions)?.remove(terminal_id) {
+                session.stop()?;
+            }
+            guard(&self.office_sessions)?.remove(terminal_id);
+            guard(&self.member_states)?.remove(terminal_id);
+        }
         if guard(&self.sessions)?.contains_key(terminal_id) {
             return self.snapshot();
         }
@@ -426,7 +688,27 @@ impl AppState {
                 panel.profile_id.clone(),
             )
         };
-        let spec = self.command_spec(&profile_id)?;
+        let spec = if is_member {
+            let session = self.ensure_member_session(&app, terminal_id)?;
+            let mut arguments = execution::AgentExecution {
+                level: "custom".into(),
+                model: session.model.clone(),
+                reasoning_effort: session.reasoning_effort.clone(),
+            }
+            .cli_arguments();
+            arguments.extend([
+                "--remote".into(),
+                session.endpoint.clone(),
+                "resume".into(),
+                session.thread_id.clone(),
+            ]);
+            CommandSpec {
+                executable: "codex".into(),
+                arguments,
+            }
+        } else {
+            self.command_spec(&profile_id)?
+        };
         let environment = vec![
             (
                 "KANASHA_MCP_SOCKET".to_string(),
@@ -442,12 +724,34 @@ impl AppState {
         let exit_id = terminal_id.to_string();
         let output_app = app.clone();
         let exit_app = app.clone();
+        let exit_state = self.clone();
+        let connection_id = guard(&self.office_sessions)?
+            .get(terminal_id)
+            .map(|s| s.connection_id.clone());
+        let output_connection_id = connection_id.clone();
+        let output_state = self.clone();
         let session = start_pty(
             &spec.executable,
             &spec.arguments,
             &environment,
             &root,
             move |data| {
+                // Hold the generation check through emit so a reset cannot publish
+                // its screen barrier before these old bytes are submitted.
+                let output_sessions = if is_member {
+                    match output_state.office_sessions.lock() {
+                        Ok(sessions) => Some(sessions),
+                        Err(_) => return,
+                    }
+                } else {
+                    None
+                };
+                if output_sessions.as_ref().is_some_and(|sessions| {
+                    sessions.get(&output_id).map(|s| &s.connection_id)
+                        != output_connection_id.as_ref()
+                }) {
+                    return;
+                }
                 let _ = output_app.emit(
                     "terminal-output",
                     TerminalOutput {
@@ -457,11 +761,28 @@ impl AppState {
                 );
             },
             move || {
+                let _terminal_gate = match exit_state.terminal_gate.lock() {
+                    Ok(gate) => gate,
+                    Err(_) => return,
+                };
+                if is_member
+                    && exit_state
+                        .office_sessions
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get(&exit_id).map(|s| s.connection_id.clone()))
+                        != connection_id
+                {
+                    return;
+                }
                 if let Ok(mut active) = sessions.lock() {
                     active.remove(&exit_id);
                 }
                 if let Ok(mut states) = agent_states.lock() {
                     states.remove(&exit_id);
+                }
+                if is_member {
+                    let _ = exit_state.close_member_session(&exit_id);
                 }
                 let _ = exit_app.emit(
                     "terminal-exit",
@@ -470,7 +791,20 @@ impl AppState {
                     },
                 );
             },
-        )?;
+        );
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                if is_member {
+                    // Startup failed before a turn. Keep pending work and the saved
+                    // new-chat checkpoint available for an explicit retry.
+                    guard(&self.office_sessions)?.remove(terminal_id);
+                    guard(&self.member_states)?.remove(terminal_id);
+                    guard(&self.member_tokens)?.remove(terminal_id);
+                }
+                return Err(error);
+            }
+        };
         guard(&self.sessions)?.insert(terminal_id.to_string(), session);
         guard(&self.agent_states)?
             .entry(terminal_id.to_string())
@@ -499,10 +833,12 @@ impl AppState {
     }
 
     fn stop_terminal(&self, terminal_id: &str) -> Result<AppSnapshot, String> {
-        let mut session = guard(&self.sessions)?
-            .remove(terminal_id)
-            .ok_or("O terminal não está ativo.")?;
-        session.stop()?;
+        let _terminal_gate = guard(&self.terminal_gate)?;
+        self.close_member_session(terminal_id)?;
+        let session = guard(&self.sessions)?.remove(terminal_id);
+        if let Some(mut session) = session {
+            session.stop()?;
+        }
         guard(&self.agent_states)?.remove(terminal_id);
         self.snapshot()
     }
@@ -626,6 +962,13 @@ impl AppState {
         if ids.iter().any(|id| active.contains_key(id)) {
             return Err("Há terminais ativos. Encerre-os após confirmar a ação.".to_string());
         }
+        if ids.iter().any(|id| {
+            self.office_sessions
+                .lock()
+                .is_ok_and(|sessions| sessions.contains_key(id))
+        }) {
+            return Err("Há sessões de equipe ativas. Encerre-as antes de remover.".into());
+        }
         Ok(())
     }
 
@@ -663,12 +1006,53 @@ fn name(value: &str, subject: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn selected_task<'a>(
+    workspace: &'a Workspace,
+    code: Option<&str>,
+) -> Result<&'a TaskState, String> {
+    match code {
+        None => Ok(&workspace.task),
+        Some(code) => workspace.tasks.iter().find(|t| t.task_code == code).map(|t| &t.state).ok_or_else(|| "Tarefa não cadastrada nesta sala. O gerente deve registrá-la com set_task e taskCode.".into()),
+    }
+}
+
 fn task_text(value: String, limit: usize, subject: &str) -> Result<String, String> {
     let value = value.trim();
     if value.contains('\0') || value.chars().count() > limit {
         return Err(format!("O {subject} da tarefa excede o limite permitido."));
     }
     Ok(value.to_string())
+}
+
+fn task_step_id(value: String) -> Result<String, String> {
+    let id = value.trim();
+    if id.is_empty()
+        || id.len() > 40
+        || !id.bytes().all(|character| {
+            character.is_ascii_alphanumeric() || character == b'-' || character == b'_'
+        })
+    {
+        return Err("Informe um identificador válido para a etapa.".to_string());
+    }
+    Ok(id.to_string())
+}
+
+fn task_steps(steps: Vec<TaskStep>) -> Result<Vec<TaskStep>, String> {
+    if steps.len() > 20 {
+        return Err("A tarefa aceita no máximo 20 etapas.".to_string());
+    }
+    let mut ids = HashSet::new();
+    steps
+        .into_iter()
+        .map(|mut step| {
+            step.id = task_step_id(step.id)?;
+            step.title = task_text(step.title, 160, "título da etapa")?;
+            if step.title.is_empty() || !ids.insert(step.id.clone()) {
+                return Err("As etapas precisam de títulos e identificadores únicos.".to_string());
+            }
+            Ok(step)
+        })
+        .collect()
 }
 
 fn unix_timestamp() -> Result<u64, String> {
@@ -880,11 +1264,15 @@ fn codex_mcp_arguments() -> Result<Vec<String>, String> {
         "-c".into(),
         "mcp_servers.kanasha_terminal.env_vars=[\"KANASHA_MCP_SOCKET\",\"KANASHA_MCP_TOKEN\",\"KANASHA_WORKSPACE_ID\",\"KANASHA_TERMINAL_ID\"]".into(),
         "-c".into(),
-        "mcp_servers.kanasha_terminal.enabled_tools=[\"task_state\"]".into(),
+        "mcp_servers.kanasha_terminal.enabled_tools=[\"get_task\",\"get_task_steps\",\"set_task\"]".into(),
         "-c".into(),
-        "mcp_servers.kanasha_terminal.tools.task_state.output_token_limit=512".into(),
+        "mcp_servers.kanasha_terminal.tools.get_task.output_token_limit=12288".into(),
         "-c".into(),
-        "mcp_servers.kanasha_terminal.tools.task_state.approval_mode=\"approve\"".into(),
+        "mcp_servers.kanasha_terminal.tools.get_task_steps.output_token_limit=8192".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.set_task.output_token_limit=1024".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.set_task.approval_mode=\"approve\"".into(),
     ])
 }
 
@@ -1064,12 +1452,49 @@ fn set_split_ratio(
     state.set_split_ratio(input)
 }
 #[tauri::command]
-fn start_terminal(
+async fn start_terminal(
     app: AppHandle,
     state: State<'_, AppState>,
     terminal_id: String,
 ) -> Result<AppSnapshot, String> {
-    state.start_terminal(app, &terminal_id)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = state.start_terminal(app.clone(), &terminal_id)?;
+        if snapshot
+            .areas
+            .iter()
+            .flat_map(|a| &a.workspaces)
+            .flat_map(|w| &w.panels)
+            .any(|p| p.id == terminal_id && p.member.is_some())
+        {
+            state.wake_member(&app, &terminal_id);
+        }
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn list_codex_models(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let root = {
+        let persisted = guard(&state.persisted)?;
+        persisted
+            .areas
+            .iter()
+            .find(|area| {
+                area.workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == workspace_id)
+            })
+            .map(|area| PathBuf::from(&area.root_path))
+            .ok_or("Workspace não encontrado.")?
+    };
+    tauri::async_runtime::spawn_blocking(move || codex::CodexSession::list_models(&root))
+        .await
+        .map_err(|e| e.to_string())?
 }
 #[tauri::command]
 fn write_terminal(
@@ -1115,6 +1540,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            if env::args().any(|arg| arg == "--office-smoke") {
+                let directory = PathBuf::from("/tmp").join(format!("kt-smoke-{}", new_id()));
+                fs::create_dir_all(&directory)?;
+                let state = AppState::load(directory.join("workspace.json"))?;
+                mcp::start_listener(state.clone(), app.handle().clone())?;
+                app.manage(state.clone());
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+                office::run_smoke(app.handle().clone(), state, directory);
+                return Ok(());
+            }
             let directory = app
                 .path()
                 .app_config_dir()
@@ -1126,6 +1564,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            list_codex_models,
+            area_instructions::prepare_area,
+            area_instructions::get_area_instructions,
+            area_instructions::set_area_instructions,
             create_area,
             rename_area,
             change_area_root,
@@ -1147,10 +1589,30 @@ pub fn run() {
             stop_terminal,
             create_custom_profile,
             configure_custom_profile,
-            remove_custom_profile
+            remove_custom_profile,
+            office::hire_agent,
+            office::edit_agent,
+            office::assign_agent,
+            office::interrupt_agent,
+            office::reset_agent_context,
+            office::answer_agent,
+            learning::set_agent_memory,
+            soul::set_agent_soul,
+            soul::approve_agent_soul,
+            learning::complete_training,
+            learning::request_onboarding
         ])
-        .run(tauri::generate_context!())
-        .expect("Erro ao executar o KanashaTerminal");
+        .build(tauri::generate_context!())
+        .expect("Erro ao executar o KanashaTerminal")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(mut sessions) = state.office_sessions.lock() {
+                        sessions.clear();
+                    }
+                }
+            }
+        });
 }
 
 pub fn run_mcp() {
@@ -1162,9 +1624,9 @@ mod tests {
     use super::*;
 
     fn state_path() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!("kanasha-terminal-test-{}", new_id()))
-            .join("workspace.json")
+        let root = std::env::temp_dir().join(format!("kanasha-terminal-test-{}", new_id()));
+        fs::create_dir_all(&root).expect("isolated test area");
+        root.join("workspace.json")
     }
 
     #[test]
@@ -1193,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_profile_enables_only_the_compact_kanasha_tool() {
+    fn codex_profile_enables_the_task_tools() {
         let mut arguments = codex_mcp_arguments().expect("Codex MCP arguments");
         force_yolo(CODEX, &mut arguments);
         assert_eq!(
@@ -1203,12 +1665,18 @@ mod tests {
         assert!(arguments
             .iter()
             .any(|argument| argument
-                == "mcp_servers.kanasha_terminal.enabled_tools=[\"task_state\"]"));
+                == "mcp_servers.kanasha_terminal.enabled_tools=[\"get_task\",\"get_task_steps\",\"set_task\"]"));
         assert!(arguments.iter().any(|argument| {
-            argument == "mcp_servers.kanasha_terminal.tools.task_state.output_token_limit=512"
+            argument == "mcp_servers.kanasha_terminal.tools.get_task.output_token_limit=12288"
         }));
         assert!(arguments.iter().any(|argument| {
-            argument == "mcp_servers.kanasha_terminal.tools.task_state.approval_mode=\"approve\""
+            argument == "mcp_servers.kanasha_terminal.tools.get_task_steps.output_token_limit=8192"
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument == "mcp_servers.kanasha_terminal.tools.set_task.output_token_limit=1024"
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument == "mcp_servers.kanasha_terminal.tools.set_task.approval_mode=\"approve\""
         }));
         assert!(arguments.iter().any(|argument| {
             argument.contains("KANASHA_WORKSPACE_ID") && argument.contains("KANASHA_MCP_TOKEN")
@@ -1246,12 +1714,75 @@ mod tests {
     }
 
     #[test]
+    fn workspace_kinds_preserve_normal_and_team_behavior_across_reload_and_legacy_files() {
+        use models::WorkspaceKind;
+        let path = state_path();
+        let root = path.parent().unwrap();
+        let state = AppState::load(path.clone()).unwrap();
+        // Omitted kind uses the original, ordinary workspace behavior.
+        let input: CreateAreaInput = serde_json::from_value(serde_json::json!({
+            "name": "Tipos", "rootPath": root
+        }))
+        .unwrap();
+        let snap = state.create_area(input).unwrap();
+        let area_id = snap.areas[0].id.clone();
+        let normal = snap.areas[0].workspaces[0].clone();
+        assert_eq!(normal.kind, WorkspaceKind::Normal);
+        assert!(normal.panels.is_empty());
+        assert!(!root.join(".kanasha/AGENTS.md").exists());
+        state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: normal.id.clone(),
+                profile_id: SHELL.into(),
+                title: None,
+                target_panel_id: None,
+                direction: None,
+            })
+            .unwrap();
+        assert!(state
+            .hire_agent(models::HireAgentInput {
+                workspace_id: normal.id.clone(),
+                name: "Pessoa".into(),
+                specialty: "DEV".into(),
+                instructions: String::new(),
+                execution: None,
+            })
+            .is_err());
+        let input: CreateWorkspaceInput = serde_json::from_value(serde_json::json!({
+            "areaId": area_id, "name": "Equipe", "kind": "team"
+        }))
+        .unwrap();
+        let snap = state.create_workspace(input).unwrap();
+        let team = &snap.areas[0].workspaces[1];
+        assert_eq!(team.kind, WorkspaceKind::Team);
+        assert!(team.panels[0].member.as_ref().unwrap().manager);
+        assert!(root.join(".kanasha/AGENTS.md").exists());
+        state.duplicate_workspace(&normal.id).unwrap();
+        let before = state.duplicate_workspace(&team.id).unwrap();
+        assert_eq!(before.areas[0].workspaces[1].kind, WorkspaceKind::Normal);
+        assert_eq!(before.areas[0].workspaces[3].kind, WorkspaceKind::Team);
+        let restored = AppState::load(path.clone()).unwrap().snapshot().unwrap();
+        assert_eq!(restored.areas, before.areas);
+        // Simulate a pre-kind file: infer teams only from existing members.
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for workspace in legacy["areas"][0]["workspaces"].as_array_mut().unwrap() {
+            workspace.as_object_mut().unwrap().remove("kind");
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = AppState::load(path.clone()).unwrap().snapshot().unwrap();
+        assert_eq!(migrated.areas, before.areas);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn areas_and_workspaces_are_restored_but_processes_are_not() {
         let path = state_path();
-        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let root = path.parent().unwrap().to_string_lossy().into_owned();
         let state = AppState::load(path.clone()).expect("state");
         let created = state
             .create_area(CreateAreaInput {
+                workspace_kind: crate::models::WorkspaceKind::Team,
                 name: "Área persistida".into(),
                 root_path: root,
             })
@@ -1274,7 +1805,14 @@ mod tests {
             .snapshot()
             .expect("snapshot");
         assert_eq!(restored.areas[0].id, area_id);
-        assert_eq!(restored.areas[0].workspaces[0].panels.len(), 1);
+        assert_eq!(restored.areas[0].workspaces[0].panels.len(), 2);
+        assert!(
+            restored.areas[0].workspaces[0].panels[0]
+                .member
+                .as_ref()
+                .unwrap()
+                .manager
+        );
         assert!(restored.active_terminal_ids.is_empty());
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
     }
@@ -1282,10 +1820,11 @@ mod tests {
     #[test]
     fn panel_label_and_split_ratio_are_saved_as_safe_layout_metadata() {
         let path = state_path();
-        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let root = path.parent().unwrap().to_string_lossy().into_owned();
         let state = AppState::load(path.clone()).expect("state");
         let created = state
             .create_area(CreateAreaInput {
+                workspace_kind: crate::models::WorkspaceKind::Team,
                 name: "Área de teste".into(),
                 root_path: root,
             })
@@ -1353,10 +1892,11 @@ mod tests {
     #[test]
     fn task_and_agent_states_are_scoped_updated_and_persisted_as_expected() {
         let path = state_path();
-        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let root = path.parent().unwrap().to_string_lossy().into_owned();
         let state = AppState::load(path.clone()).expect("state");
         let created = state
             .create_area(CreateAreaInput {
+                workspace_kind: crate::models::WorkspaceKind::Team,
                 name: "Área de teste".into(),
                 root_path: root,
             })
@@ -1389,7 +1929,9 @@ mod tests {
                 &terminal_id,
                 Some(TaskPatch {
                     status: Some(models::TaskStatus::InProgress),
-                    summary: Some("  Implementando o resumo por MCP.  ".into()),
+                    summary: Some("  # Objetivo\nImplementar o resumo por MCP.\n\n## Escopo\nPersistir o estado.  ".into()),
+                    steps: None,
+                    step_status: None,
                     current: Some("Persistindo o estado".into()),
                     next: Some("Validar a interface".into()),
                     blocker: None,
@@ -1399,7 +1941,10 @@ mod tests {
             )
             .expect("first update");
         assert_eq!(first.task.revision, 1);
-        assert_eq!(first.task.summary, "Implementando o resumo por MCP.");
+        assert_eq!(
+            first.task.summary,
+            "# Objetivo\nImplementar o resumo por MCP.\n\n## Escopo\nPersistir o estado."
+        );
         assert!(first.task.updated_at > 0);
         assert_eq!(first.agent.status, models::AgentStatus::Working);
         assert_eq!(first.agent.current, "Implementando o backend");
@@ -1477,7 +2022,7 @@ mod tests {
                 &terminal_id,
                 Some(TaskPatch {
                     status: Some(models::TaskStatus::Done),
-                    summary: Some("x".repeat(801)),
+                    summary: Some("x".repeat(8001)),
                     ..TaskPatch::default()
                 }),
             )
@@ -1518,12 +2063,139 @@ mod tests {
     }
 
     #[test]
-    fn edited_names_and_terminal_labels_are_validated_and_persisted() {
+    fn task_steps_are_persisted_and_can_be_updated_without_replacing_the_list() {
         let path = state_path();
-        let root = std::env::temp_dir().to_string_lossy().into_owned();
         let state = AppState::load(path.clone()).expect("state");
         let created = state
             .create_area(CreateAreaInput {
+                workspace_kind: crate::models::WorkspaceKind::Team,
+                name: "Área de teste".into(),
+                root_path: path.parent().unwrap().to_string_lossy().into_owned(),
+            })
+            .expect("area");
+        let workspace_id = created.areas[0].workspaces[0].id.clone();
+        let created = state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: workspace_id.clone(),
+                profile_id: SHELL.into(),
+                title: None,
+                target_panel_id: None,
+                direction: None,
+            })
+            .expect("terminal");
+        let terminal_id = created.areas[0].workspaces[0].panels[0].id.clone();
+        let steps = vec![
+            TaskStep {
+                id: "investigar".into(),
+                title: "Investigar o problema".into(),
+                status: models::TaskStatus::InProgress,
+            },
+            TaskStep {
+                id: "validar".into(),
+                title: "Validar a correção".into(),
+                status: models::TaskStatus::NotStarted,
+            },
+        ];
+        let created = state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    steps: Some(steps.clone()),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("create steps");
+        assert_eq!(created.task.steps, steps);
+
+        let updated = state
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    step_status: Some(models::StepStatusPatch {
+                        id: "investigar".into(),
+                        status: models::TaskStatus::Done,
+                    }),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("update one step");
+        assert_eq!(updated.task.steps[0].status, models::TaskStatus::Done);
+        assert_eq!(updated.task.steps[1], steps[1]);
+        assert_eq!(updated.task.revision, created.task.revision + 1);
+
+        for patch in [
+            TaskPatch {
+                summary: Some("Não deve ser salvo".into()),
+                step_status: Some(models::StepStatusPatch {
+                    id: "inexistente".into(),
+                    status: models::TaskStatus::Done,
+                }),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                steps: Some(vec![steps[0].clone(), steps[0].clone()]),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                steps: Some(vec![TaskStep {
+                    id: "invalid id".into(),
+                    ..steps[0].clone()
+                }]),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                steps: Some(vec![TaskStep {
+                    title: " ".into(),
+                    ..steps[0].clone()
+                }]),
+                ..TaskPatch::default()
+            },
+        ] {
+            assert!(state
+                .task_context(&workspace_id, &terminal_id, Some(patch))
+                .is_err());
+            assert_eq!(
+                state
+                    .task_context(&workspace_id, &terminal_id, None)
+                    .expect("unchanged")
+                    .task,
+                updated.task
+            );
+        }
+
+        drop(state);
+        let restored = AppState::load(path.clone()).expect("restored state");
+        assert_eq!(
+            restored
+                .task_context(&workspace_id, &terminal_id, None)
+                .expect("restored steps")
+                .task,
+            updated.task
+        );
+        let cleared = restored
+            .task_context(
+                &workspace_id,
+                &terminal_id,
+                Some(TaskPatch {
+                    steps: Some(vec![]),
+                    ..TaskPatch::default()
+                }),
+            )
+            .expect("clear steps");
+        assert!(cleared.task.steps.is_empty());
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn edited_names_and_terminal_labels_are_validated_and_persisted() {
+        let path = state_path();
+        let root = path.parent().unwrap().to_string_lossy().into_owned();
+        let state = AppState::load(path.clone()).expect("state");
+        let created = state
+            .create_area(CreateAreaInput {
+                workspace_kind: crate::models::WorkspaceKind::Team,
                 name: "Área inicial".into(),
                 root_path: root,
             })

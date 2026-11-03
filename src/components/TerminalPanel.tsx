@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { terminalApi } from "../api";
 import type { AgentStatus, TerminalExit, TerminalOutput, TerminalPanelModel } from "../types";
 
@@ -19,6 +19,7 @@ function openExternalTerminalLink(value: string) {
 }
 
 type TerminalPanelProps = {
+  style?: CSSProperties;
   panel: TerminalPanelModel;
   active: boolean;
   agentStatus?: AgentStatus;
@@ -26,6 +27,8 @@ type TerminalPanelProps = {
   maximized: boolean;
   onStart: (terminalId: string) => void;
   onStop: (terminalId: string) => void;
+  onNewConversation?: (terminalId: string) => void;
+  newConversationDisabled?: boolean;
   onClose: (terminalId: string) => void;
   onSplit: (terminalId: string, direction: "horizontal" | "vertical") => void;
   onFocus: (terminalId: string) => void;
@@ -34,6 +37,7 @@ type TerminalPanelProps = {
 };
 
 export function TerminalPanel({
+  style,
   panel,
   active,
   agentStatus,
@@ -41,31 +45,46 @@ export function TerminalPanel({
   maximized,
   onStart,
   onStop,
+  onNewConversation,
+  newConversationDisabled = false,
   onClose,
   onSplit,
   onFocus,
   onToggleMaximize,
   onContextMenu,
 }: TerminalPanelProps) {
+  const [contextGeneration, setContextGeneration] = useState(0);
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const pendingOutputRef = useRef<string[]>([]);
 
   useEffect(() => {
     let disposed = false;
     let unlistenOutput: (() => void) | undefined;
+    let unlistenReset: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
 
     void listen<TerminalOutput>("terminal-output", (event) => {
-      if (event.payload.terminalId === panel.id) {
-        terminalRef.current?.write(event.payload.data);
+      if (!disposed && event.payload.terminalId === panel.id) {
+        if (terminalRef.current) terminalRef.current.write(event.payload.data);
+        else pendingOutputRef.current.push(event.payload.data);
       }
     }).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenOutput = unlisten;
     });
+    void listen<TerminalExit>("terminal-context-reset", event => {
+      if (!disposed && event.payload.terminalId === panel.id) {
+        pendingOutputRef.current = [];
+        // A fresh PTY starts at 120x36. Recreate xterm at that size and buffer
+        // replacement output until React attaches it, then fit as on first open.
+        terminalRef.current = null;
+        setContextGeneration(value => value + 1);
+      }
+    }).then(unlisten => { if (disposed) unlisten(); else unlistenReset = unlisten; });
     void listen<TerminalExit>("terminal-exit", (event) => {
-      if (event.payload.terminalId === panel.id) {
+      if (!disposed && event.payload.terminalId === panel.id) {
         terminalRef.current?.write("\r\n\x1b[33mProcesso encerrado.\x1b[0m\r\n");
       }
     }).then((unlisten) => {
@@ -75,8 +94,10 @@ export function TerminalPanel({
 
     return () => {
       disposed = true;
+      pendingOutputRef.current = [];
       unlistenOutput?.();
       unlistenExit?.();
+      unlistenReset?.();
     };
   }, [panel.id]);
 
@@ -85,7 +106,11 @@ export function TerminalPanel({
 
     const terminal = new Terminal({
       cursorBlink: true,
-      convertEol: true,
+      // Must match start_pty's initial size until its queued output is parsed.
+      cols: 120,
+      rows: 36,
+      // PTY output already contains its own CR/LF and cursor positioning.
+      convertEol: false,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 12,
       linkHandler: {
@@ -108,11 +133,15 @@ export function TerminalPanel({
       openExternalTerminalLink(uri);
     }));
     terminal.open(hostRef.current);
-    fitAddon.fit();
     terminalRef.current = terminal;
     const disposeInput = terminal.onData((data) => {
       void terminalApi.writeTerminal(panel.id, data);
     });
+    // The PTY starts before start_terminal returns the active-panel snapshot.
+    // Replay its early output after input is connected: these bytes include mouse
+    // modes and terminal queries, not just text that can safely be discarded.
+    for (const data of pendingOutputRef.current) terminal.write(data);
+    pendingOutputRef.current = [];
     const resize = () => {
       if (
         !hostRef.current ||
@@ -127,17 +156,24 @@ export function TerminalPanel({
       }
     };
     const observer = new ResizeObserver(resize);
-    observer.observe(hostRef.current);
-    resize();
+    let disposed = false;
+    // write() parses asynchronously. Fitting before this barrier would interpret
+    // the initial screen's cursor commands using a different width from the PTY.
+    terminal.write("", () => {
+      if (disposed || !hostRef.current) return;
+      observer.observe(hostRef.current);
+      resize();
+    });
     terminal.focus();
 
     return () => {
+      disposed = true;
       observer.disconnect();
       disposeInput.dispose();
       terminalRef.current = null;
       terminal.dispose();
     };
-  }, [active, panel.id]);
+  }, [active, panel.id, contextGeneration]);
 
   useEffect(() => {
     if (!focused) return;
@@ -165,6 +201,7 @@ export function TerminalPanel({
 
   return (
     <section
+      style={style}
       ref={panelRef}
       className={`terminal-panel ${focused ? "is-focused" : ""} ${maximized ? "is-maximized" : ""}`}
       aria-label={`Terminal ${panel.title}`}
@@ -189,6 +226,16 @@ export function TerminalPanel({
               ▶
             </button>
           )}
+          {panel.member?.manager && onNewConversation ? <button
+            className="new-conversation"
+            title={newConversationDisabled ? "Nova conversa — aguarde o gerente ficar disponível, sem execução ou pergunta pendente." : "Nova conversa — preserva alma, memória, arquivos, histórico e fila."}
+            aria-label={`Nova conversa com ${panel.title}`}
+            disabled={newConversationDisabled}
+            onClick={() => onNewConversation(panel.id)}
+          ><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+            <path d="M20 11.5a8 8 0 0 1-8 8H5l-4 3v-6a8 8 0 0 1 11-12" />
+            <path d="M18 2v8m-4-4h8" />
+          </svg></button> : null}
           <button title="Dividir à direita" aria-label={`Dividir ${panel.title} à direita`} onClick={() => onSplit(panel.id, "vertical")}>
             ◧
           </button>
