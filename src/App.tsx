@@ -34,6 +34,7 @@ type TextDialogState =
   | { kind: "rename-area"; areaId: string }
   | { kind: "rename-workspace"; workspaceId: string }
   | { kind: "rename-terminal"; terminalId: string }
+  | { kind: "manager-task"; terminalId: string }
   | { kind: "terminal-label"; terminalId: string };
 
 const MIN_SPLIT_RATIO = 0.15;
@@ -335,6 +336,42 @@ function App() {
     }
   }
 
+  async function deleteManagerConversation(terminalId: string) {
+    if (pendingResets.current.has(terminalId)) return;
+    const member = snapshot?.areas.flatMap(area => area.workspaces).flatMap(workspace => workspace.panels).find(panel => panel.id === terminalId)?.member;
+    if (!member?.manager) return;
+    const taskCode = member.managerTaskCode ?? null;
+    const expectedThreadId = member.threadId ?? null;
+    const description = taskCode
+      ? `Excluir a conversa de ${taskCode}? Você voltará para Geral. Ao abrir esse código novamente, começará uma conversa nova.`
+      : "Excluir a conversa Geral? Ela será substituída por uma conversa vazia.";
+    if (!window.confirm(`${description}\n\nA tarefa, os arquivos e os retornos pendentes serão preservados. Tasks com retornos pendentes continuam no seletor.`)) return;
+    pendingResets.current.add(terminalId);
+    setResettingTerminalIds(new Set(pendingResets.current));
+    try {
+      applySnapshot(await terminalApi.deleteManagerConversation({ terminalId, taskCode, expectedThreadId }));
+      resetRequestIds.current.delete(terminalId);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      pendingResets.current.delete(terminalId);
+      setResettingTerminalIds(new Set(pendingResets.current));
+    }
+  }
+
+  async function selectManagerTask(terminalId: string, taskCode: string | null) {
+    if (pendingResets.current.has(terminalId)) throw new Error("Aguarde a troca de conversa em andamento.");
+    pendingResets.current.add(terminalId);
+    setResettingTerminalIds(new Set(pendingResets.current));
+    try {
+      applySnapshot(await terminalApi.selectManagerConversation(terminalId, taskCode));
+      resetRequestIds.current.delete(terminalId);
+    } finally {
+      pendingResets.current.delete(terminalId);
+      setResettingTerminalIds(new Set(pendingResets.current));
+    }
+  }
+
   function showMenu(event: React.MouseEvent, entries: MenuEntry[]) {
     event.preventDefault();
     setContextMenu({ x: event.clientX, y: event.clientY, entries });
@@ -415,6 +452,11 @@ function App() {
     }
 
     try {
+      if (textDialog.kind === "manager-task") {
+        await selectManagerTask(textDialog.terminalId, value);
+        closeTextDialog();
+        return;
+      }
       let next: AppSnapshot;
       switch (textDialog.kind) {
         case "create-workspace":
@@ -816,7 +858,7 @@ function App() {
             const isSelected = workspace.id === selectedWorkspace?.id;
             const layout = workspaceLayout(workspace);
             return <div className={`workspace-terminal-layout ${isSelected ? "" : "is-hidden"}`} key={workspace.id} aria-hidden={!isSelected}>
-              {layout ? <LayoutTree memberStates={snapshot.memberStates} resettingTerminalIds={resettingTerminalIds} onNewConversation={id => void newManagerConversation(id)} node={layout} automatic={workspace.panels.some(panel => panel.member?.manager)} panels={workspace.panels} activeIds={activeIds} agentStates={agentStates} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
+              {layout ? <LayoutTree onDeleteConversation={id => void deleteManagerConversation(id)} taskCodes={workspace.tasks?.map(task => task.taskCode) ?? []} onSelectTask={(id, code) => void selectManagerTask(id, code).catch(cause => setError(errorMessage(cause)))} onCreateTask={id => openTextDialog({ kind: "manager-task", terminalId: id }, "")} memberStates={snapshot.memberStates} resettingTerminalIds={resettingTerminalIds} onNewConversation={id => void newManagerConversation(id)} node={layout} automatic={workspace.panels.some(panel => panel.member?.manager)} panels={workspace.panels} activeIds={activeIds} agentStates={agentStates} focusedPanelId={focusedPanelId} maximizedPanelId={maximizedPanelId} pendingSplitRatios={pendingSplitRatios} onStart={(id) => void run(terminalApi.startTerminal(id))} onStop={(id) => { if (window.confirm("Encerrar este processo?")) void run(terminalApi.stopTerminal(id)); }} onClose={(id) => void stopAndRemoveTerminal(id)} onSplit={(id, direction) => void addTerminal(id, direction)} onFocus={setFocusedPanelId} onToggleMaximize={(id) => { setFocusedPanelId(id); setMaximizedPanelId((current) => current === id ? null : id); }} onRatioChange={(splitId, ratio) => setPendingSplitRatios((current) => ({ ...current, [splitId]: ratio }))} onRatioCommit={(splitId, ratio) => void persistSplitRatio(splitId, ratio)} onContextMenu={(event, id) => { const panel = workspace.panels.find((item) => item.id === id); if (panel) showMenu(event, terminalMenu(panel)); }} /> : <div className="empty-workspace"><h1>{workspace.name}</h1><p>Abra o primeiro terminal para começar. Ele iniciará na pasta-raiz da Área.</p><button title="Abrir primeiro terminal" onClick={() => void addTerminal()}>Abrir terminal</button></div>}
             </div>;
           })}
         </section>
@@ -942,6 +984,10 @@ type LayoutTreeProps = {
   onStart: (id: string) => void;
   onStop: (id: string) => void;
   onNewConversation: (id: string) => void;
+  onDeleteConversation: (id: string) => void;
+  taskCodes: string[];
+  onSelectTask: (id: string, code: string | null) => void;
+  onCreateTask: (id: string) => void;
   resettingTerminalIds: Set<string>;
   memberStates: AppSnapshot["memberStates"];
   onClose: (id: string) => void;
@@ -969,7 +1015,7 @@ function rectStyle(rect: LayoutRect): CSSProperties {
   return { position: "absolute", left: length(rect.left), top: length(rect.top), width: length(rect.width), height: length(rect.height) };
 }
 
-function LayoutTree({ memberStates, resettingTerminalIds, onNewConversation, node, automatic, panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
+function LayoutTree({ onDeleteConversation, taskCodes, onSelectTask, onCreateTask, memberStates, resettingTerminalIds, onNewConversation, node, automatic, panels, activeIds, agentStates, focusedPanelId, maximizedPanelId, pendingSplitRatios, onStart, onStop, onClose, onSplit, onFocus, onToggleMaximize, onRatioChange, onRatioCommit, onContextMenu }: LayoutTreeProps) {
   const positions = new Map<string, CSSProperties>();
   const dividers: { node: Extract<LayoutNode, { kind: "split" }>; ratio: number; region: CSSProperties; style: CSSProperties }[] = [];
   const visit = (current: LayoutNode, rect: LayoutRect) => {
@@ -999,8 +1045,8 @@ function LayoutTree({ memberStates, resettingTerminalIds, onNewConversation, nod
       const visible = positions.has(panel.id) && (!maximized || maximized === panel.id);
       const style = visible ? (maximized ? rectStyle(FULL_LAYOUT_RECT) : positions.get(panel.id)) : { display: "none" };
       const runtime = memberStates?.[panel.id];
-      const newConversationDisabled = resettingTerminalIds.has(panel.id) || !!panel.member?.paused || !!runtime?.turnId || !!runtime?.request || !!panel.member?.jobs.some(job => job.status === "running" || job.status === "uncertain");
-      return <TerminalPanel onNewConversation={onNewConversation} newConversationDisabled={newConversationDisabled} key={panel.id} style={style} panel={panel} active={activeIds.has(panel.id)} agentStatus={agentStates[panel.id]?.status} focused={focusedPanelId === panel.id} maximized={maximized === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} />;
+      const newConversationDisabled = resettingTerminalIds.has(panel.id) || !!panel.member?.paused || !!runtime?.turnId || !!runtime?.request || !!panel.member?.jobs.some(job => (job.status === "running" || job.status === "uncertain") && (!panel.member?.manager || (job.taskCode ?? null) === (panel.member.managerTaskCode ?? null)));
+      return <TerminalPanel switchConversationDisabled={resettingTerminalIds.has(panel.id)} conversationActivity={runtime?.backgroundConversations} onDeleteConversation={onDeleteConversation} taskCodes={taskCodes} onSelectTask={onSelectTask} onCreateTask={onCreateTask} onNewConversation={onNewConversation} newConversationDisabled={newConversationDisabled} key={panel.id} style={style} panel={panel} active={activeIds.has(panel.id)} agentStatus={agentStates[panel.id]?.status} focused={focusedPanelId === panel.id} maximized={maximized === panel.id} onStart={onStart} onStop={onStop} onClose={onClose} onSplit={onSplit} onFocus={onFocus} onToggleMaximize={onToggleMaximize} onContextMenu={onContextMenu} />;
     })}
     {!maximized && !automatic && dividers.map(({ node: split, ratio, region, style }) => <div key={split.id} className="terminal-divider-region" style={region}>
       <SplitDivider splitId={split.id} direction={split.direction} ratio={ratio} style={style} onChange={onRatioChange} onCommit={onRatioCommit} />
@@ -1073,6 +1119,8 @@ function TextEditDialog({ workspaceKind, onWorkspaceKind, dialog, value, error, 
         submit: "Salvar etiqueta",
         hint: "Use uma marca curta para identificar o painel. Deixe em branco para remover a etiqueta.",
       }
+    : dialog.kind === "manager-task"
+      ? { title: "Conversa por tarefa", field: "Código da tarefa", submit: "Abrir conversa", hint: "Ex.: B2C-4423. Retoma a conversa existente ou inicia uma conversa separada para esse código." }
     : dialog.kind === "create-workspace"
       ? {
           title: "Novo workspace",

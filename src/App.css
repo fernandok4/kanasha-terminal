@@ -292,3 +292,5 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .delivery-history summary { cursor: pointer; color: var(--text-primary); }
 .delivery-history pre { max-height: 240px; overflow: auto; white-space: pre-wrap; }
 .delivery-history code { overflow-wrap: anywhere; }
+
+.manager-task-select { max-width: 190px; min-width: 92px; height: 26px; padding: 0 6px; font-size: 11px; }

@@ -16,7 +16,13 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => appWindow,
 }));
 vi.mock("./components/TerminalPanel", () => ({
-  TerminalPanel: ({ panel, style, focused, onNewConversation, newConversationDisabled, onFocus, onClose, onToggleMaximize, onContextMenu }: { onNewConversation?: (id: string) => void; newConversationDisabled?: boolean; panel: { id: string; title: string; label?: string | null }; style?: React.CSSProperties; onToggleMaximize: (id: string) => void; focused: boolean; onFocus: (id: string) => void; onClose: (id: string) => void; onContextMenu: (event: React.MouseEvent, id: string) => void }) => <div style={style} data-testid={`terminal-panel-${panel.id}`} data-focused={focused} data-label={panel.label ?? ""} onContextMenu={(event) => onContextMenu(event, panel.id)}><button onClick={() => onFocus(panel.id)}>{panel.title}</button>{onNewConversation ? <button disabled={newConversationDisabled} onClick={() => onNewConversation(panel.id)}>Nova conversa com {panel.title}</button> : null}<button aria-label={`Alternar maximização de ${panel.title}`} onClick={() => onToggleMaximize(panel.id)}>Ampliar</button><button aria-label={`Fechar ${panel.title}`} onClick={() => onClose(panel.id)}>×</button></div>,
+  TerminalPanel: ({ panel, style, focused, onNewConversation, onDeleteConversation, newConversationDisabled, switchConversationDisabled, onSelectTask, taskCodes, onFocus, onClose, onToggleMaximize, onContextMenu }: React.ComponentProps<typeof import("./components/TerminalPanel").TerminalPanel>) => <div style={style} data-testid={`terminal-panel-${panel.id}`} data-focused={focused} data-label={panel.label ?? ""} onContextMenu={(event) => onContextMenu(event, panel.id)}>
+    <button onClick={() => onFocus(panel.id)}>{panel.title}</button>
+    {onSelectTask ? <select aria-label={`Task de ${panel.title}`} disabled={switchConversationDisabled} value={panel.member?.managerTaskCode ?? ""} onChange={e => onSelectTask(panel.id, e.target.value || null)}><option value="">Geral</option>{taskCodes?.map(code => <option key={code} value={code}>{code}</option>)}</select> : null}
+    {onNewConversation ? <button disabled={newConversationDisabled} onClick={() => onNewConversation(panel.id)}>Nova conversa com {panel.title}</button> : null}
+    {onDeleteConversation ? <button disabled={newConversationDisabled} onClick={() => onDeleteConversation(panel.id)}>Excluir conversa com {panel.title}</button> : null}
+    <button aria-label={`Alternar maximização de ${panel.title}`} onClick={() => onToggleMaximize(panel.id)}>Ampliar</button><button aria-label={`Fechar ${panel.title}`} onClick={() => onClose(panel.id)}>×</button>
+  </div>,
 }));
 
 describe("KanashaTerminal", () => {
@@ -109,6 +115,55 @@ describe("KanashaTerminal", () => {
     invoke.mockResolvedValue(initial);
     render(<App />);
     expect(await screen.findByRole("button", { name: "Nova conversa com Gerente" })).toBeDisabled();
+  });
+
+  it.each(["turno", "pergunta", "pausa", "incerto"])("permite mudar de chat com %s pendente", async state => {
+    const initial = managedSnapshot(0);
+    const room = initial.areas[0].workspaces[0];
+    room.tasks = [{ taskCode: "B2C-Y", state: { status: "not_started" } }];
+    room.panels[0].member!.paused = state === "pausa";
+    initial.memberStates = { manager: { connected: true, turnId: state === "turno" ? "busy" : null, activity: "", updatedAt: 0,
+      request: state === "pergunta" ? { id: 1, method: "item/tool/requestUserInput", params: {} } : null } };
+    if (state === "incerto") room.panels[0].member!.jobs = [{ id: "old", status: "uncertain", message: "", result: "", createdAt: 1, updatedAt: 1, turnId: null, assignedBy: null }];
+    let finish!: (value: AppSnapshot) => void;
+    invoke.mockImplementation((command: string) => command === "select_manager_conversation" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(initial));
+    render(<App />);
+    const dropdown = await screen.findByRole("combobox", { name: "Task de Gerente" });
+    expect(dropdown).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Nova conversa com Gerente" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Excluir conversa com Gerente" })).toBeDisabled();
+    fireEvent.change(dropdown, { target: { value: "B2C-Y" } });
+    expect(invoke).toHaveBeenCalledWith("select_manager_conversation", { terminalId: "manager", taskCode: "B2C-Y" });
+    expect(dropdown).toBeDisabled();
+    finish(initial);
+    await waitFor(() => expect(dropdown).toBeEnabled());
+  });
+
+  it("exclui somente após confirmação e bloqueia cliques durante a exclusão", async () => {
+    const initial = managedSnapshot(0);
+    initial.areas[0].workspaces[0].panels[0].member!.managerTaskCode = "B2C-X";
+    initial.areas[0].workspaces[0].panels[0].member!.threadId = "thread-X";
+    let finish!: (value: AppSnapshot) => void;
+    invoke.mockImplementation((command: string) => command === "delete_manager_conversation"
+      ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(initial));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      render(<App />);
+      const button = await screen.findByRole("button", { name: "Excluir conversa com Gerente" });
+      fireEvent.click(button);
+      expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Excluir a conversa de B2C-X?"));
+      expect(invoke).not.toHaveBeenCalledWith("delete_manager_conversation", expect.anything());
+      confirm.mockReturnValue(true);
+      fireEvent.click(button);
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+      expect(invoke.mock.calls.filter(([command]) => command === "delete_manager_conversation")).toHaveLength(1);
+      expect(invoke).toHaveBeenCalledWith("delete_manager_conversation", { input: { terminalId: "manager", taskCode: "B2C-X", expectedThreadId: "thread-X" } });
+      finish(initial);
+      await waitFor(() => expect(button).toBeEnabled());
+    } finally {
+      confirm.mockRestore();
+    }
   });
 
   it.each([0, 1, 2, 3, 4, 5, 6, 9])("reserva metade para o gerente com %s funcionários e toda a área quando sozinho", async count => {

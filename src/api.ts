@@ -27,10 +27,12 @@ export const terminalApi = {
   completeTraining: (terminalId: string, expectedRevision: number, expectedSoulRevision: number) => invoke<AppSnapshot>("complete_training", { terminalId, expectedRevision, expectedSoulRevision }),
   requestOnboarding: (terminalId: string, requestId: string) => invoke<AppSnapshot>("request_onboarding", { terminalId, requestId }),
   editAgent: (input: { terminalId: string; name: string; specialty: string; instructions: string; execution?: AgentExecution }) => invoke<AppSnapshot>("edit_agent", { input }),
+  deleteManagerConversation: (input: { terminalId: string; taskCode: string | null; expectedThreadId: string | null }) => invoke<AppSnapshot>("delete_manager_conversation", { input }),
+  selectManagerConversation: (terminalId: string, taskCode: string | null) => invoke<AppSnapshot>("select_manager_conversation", { terminalId, taskCode }),
   resetAgentContext: (terminalId: string, requestId: string) => invoke<AppSnapshot>("reset_agent_context", { input: { terminalId, requestId } }),
   assignAgent: (input: { terminalId: string; requestId: string; message: string; training?: boolean; freshContext?: boolean; taskCode?: string; stepIds?: string[] }) => invoke<AppSnapshot>("assign_agent", { input }),
   interruptAgent: (terminalId: string) => invoke<AppSnapshot>("interrupt_agent", { terminalId }),
-  answerAgent: (terminalId: string, requestId: number | string, result: unknown) => invoke<AppSnapshot>("answer_agent", { terminalId, requestId, result }),
+  answerAgent: (terminalId: string, requestId: number | string, result: unknown, connectionId: string) => invoke<AppSnapshot>("answer_agent", { terminalId, requestId, result, connectionId }),
   snapshot: () => invoke<AppSnapshot>("get_snapshot"),
   createArea: (input: { name: string; rootPath: string; workspaceKind: "normal" | "team" }) =>
     invoke<AppSnapshot>("create_area", { input }),

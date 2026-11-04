@@ -277,19 +277,26 @@ O aplicativo persiste o resumo da tarefa, cadastro da equipe, personalidades, me
 
 O botão **Resumo**, ao lado de **+ Terminal**, abre uma tela própria sem desmontar os terminais do Workspace. Além do status da tarefa, a tela mostra cada terminal e seu estado de agente: `Disponível`, `Trabalhando`, `Aguardando`, `Bloqueado`, `Concluído` ou `Desconectado`. A cor da aba do Workspace indica a situação agregada, priorizando `Trabalhando` quando pelo menos um agente está executando uma etapa.
 
-Ao iniciar o perfil **Codex**, o KanashaTerminal configura automaticamente o MCP local no processo. Há duas ferramentas de consulta, ambas sem argumentos e somente de leitura: `get_task` retorna `status`, `summary`, `current`, `next`, `blocker`, `updatedAt` e `revision` da tarefa, sem a lista de etapas; `get_task_steps` retorna a lista ordenada de etapas com seus status, além de `updatedAt` e `revision`. São chamadas MCP, não endpoints HTTP. A mesma revisão nas duas respostas identifica o mesmo estado da tarefa.
+Ao iniciar o perfil **Codex**, o KanashaTerminal configura automaticamente o MCP local. O catálogo de `tools/list` é resolvido pelo backend a partir do tipo salvo do workspace e da identidade autenticada do terminal; não depende de uma lista fixa do cliente.
 
-A ferramenta `set_task` atualiza somente os campos enviados e responde apenas `ok` após uma atualização. Ela exige ao menos um campo; para consultar, use `get_task` ou `get_task_steps`. O agente deve usar `get_task` para conhecer a tarefa ao iniciar e chamar `get_task_steps` quando precisar do andamento detalhado. Os nomes anteriores (`task_get`, `task_steps` e `task_state`) foram substituídos; inicie um novo processo de agente após atualizar o aplicativo para receber as ferramentas novas.
+| Tipo do workspace | Ferramentas |
+| --- | --- |
+| Organização normal | `get_workspace_summary`, `get_workspace_steps`, `update_workspace_summary` |
+| Equipe | `get_task`, `get_task_steps`, `set_task`, `get_tasks` e ferramentas de membros, atribuições, memória, alma e entregas |
 
-Os perfis de agentes sempre iniciam em modo irrestrito, usando a opção própria de cada CLI: `--dangerously-bypass-approvals-and-sandbox` no Codex, `--dangerously-skip-permissions` no Claude e `--approval-mode=yolo` no Gemini. A mesma regra é aplicada a perfis customizados cujo executável seja `codex`, `claude` ou `gemini`, sem duplicar uma opção equivalente já configurada. O perfil Shell e outros executáveis customizados mantêm os argumentos informados, pois não existe uma opção universal de modo irrestrito para comandos arbitrários.
+Na organização normal, as consultas não recebem argumentos. `get_workspace_summary` retorna status, resumo, andamento, próximo passo, bloqueio e revisão, sem as etapas; `get_workspace_steps` retorna etapas e revisão. `update_workspace_summary` altera somente campos enviados e exige ao menos um campo. Essas ferramentas não aceitam `taskCode` nem criam tarefas da equipe. O resumo existente é preservado.
 
-Os campos compartilhados são `status`, `summary`, `steps`, `stepStatus`, `current`, `next` e `blocker`. `summary` aceita até 8.000 caracteres. Deve explicar em linguagem fácil as tarefas reunidas, o objetivo de cada uma, o que foi implementado, quais comportamentos foram testados (ambiente, resultado e evidência), pendências e links de Jira, Raposa/MRs e GMUDs. A interface renderiza títulos, listas, destaques, tabelas e links Markdown; links HTTP(S) abrem no navegador padrão. HTML e imagens não são executados/carregados. `steps` substitui a lista ordenada da tarefa (até 20 etapas), com `id` estável, `title` e `status` em cada item. Para mudar somente o status de uma etapa, envie `stepStatus` com o `id` existente e o novo `status`. Os status possíveis são `not_started`, `in_progress`, `waiting`, `blocked` e `done`. O resumo e a lista aparecem na tela Resumo; Workspaces antigos iniciam com a lista vazia.
+Na equipe, `get_task`, `get_task_steps` e `set_task` mantêm os contratos atuais: `taskCode` seleciona uma tarefa; sem código, tratam a visão compartilhada da sala. `get_tasks` lista as tarefas. As permissões do gerente e dos membros continuam sendo verificadas em cada operação.
 
-Exemplo de argumentos de `set_task` para criar a lista: `{"steps":[{"id":"investigar","title":"Investigar o problema","status":"in_progress"},{"id":"validar","title":"Validar a correção","status":"not_started"}]}`. Para atualizar uma etapa: `{"stepStatus":{"id":"investigar","status":"done"}}`. Enviar `{"steps":[]}` limpa a lista; reenviar `steps` também permite renomear, remover ou reordenar etapas. O agente escreve o texto do resumo e a lista, sem geração automática pela interface. O MCP orienta esse formato na inicialização e na descrição de `set_task.summary`; o template v14 de `.kanasha/AGENTS.md` contém a estrutura completa. Links e resultados desconhecidos devem ser identificados como não informados/não consultados, nunca inventados. Resumos antigos continuam legíveis, mas precisam ser reescritos pelo agente com o contexto da tarefa; a interface não transforma texto vago em fatos. Reabra a sessão no aplicativo atualizado para receber as novas orientações MCP. Arquivos de instruções personalizados de outras áreas são preservados.
+O backend rejeita chamadas a ferramentas de outro tipo mesmo que um cliente tente chamá-las diretamente. Falha de autenticação ou de identificação do workspace não libera um catálogo genérico. A listagem consulta o estado atual; não há notificação automática `listChanged`.
 
-Os campos individuais são `agentStatus` e `agentCurrent`; o terminal é identificado automaticamente, sem enviar IDs na chamada. O agente reporta somente transições e mudanças relevantes de etapa, sem heartbeat periódico, para reduzir o consumo de tokens. Encerrar o processo remove seu estado ativo sem concluir a tarefa automaticamente.
+Os campos compartilhados do resumo são `status`, `summary`, `steps`, `stepStatus`, `current`, `next` e `blocker`. `summary` aceita Markdown com até 8.000 caracteres. `steps` substitui a lista completa (até 20 itens); preserve os IDs. Para atualizar uma etapa, prefira `stepStatus`. `agentStatus` e `agentCurrent` atualizam a atividade do terminal identificado pela sessão. Esses dados continuam visíveis em **Resumo**.
 
-O executável também aceita `--mcp` para uso com outros clientes MCP STDIO. Os terminais recebem `KANASHA_MCP_SOCKET`, `KANASHA_MCP_TOKEN`, `KANASHA_WORKSPACE_ID` e `KANASHA_TERMINAL_ID`; cada cliente precisa encaminhar essas variáveis ao servidor conforme sua própria configuração.
+Exemplo no workspace normal: `update_workspace_summary {"summary":"Investigação concluída","stepStatus":{"id":"investigar","status":"done"}}`. Na equipe, use `set_task` com o código real quando estiver atualizando uma tarefa específica. As ferramentas de atualização do resumo respondem `ok`.
+
+Após atualizar o aplicativo, reabra as sessões para renovar o catálogo e as instruções em cache. Os nomes antigos de tarefa deixam de ser aceitos em organizações normais; atualize instruções personalizadas para usar as ferramentas de resumo nesse tipo de workspace.
+
+O executável também aceita `--mcp` para clientes MCP STDIO. Encaminhe `KANASHA_MCP_SOCKET`, `KANASHA_MCP_TOKEN`, `KANASHA_WORKSPACE_ID` e `KANASHA_TERMINAL_ID`. São chamadas MCP locais, não endpoints HTTP; IDs extras ou o tipo do workspace não devem ser enviados nos argumentos das ferramentas.
 
 ## Pré-requisitos
 
@@ -406,7 +413,7 @@ tarefa pode ter várias pessoas e vários steps.
 Use `taskCode` com o código real do Jira. Analisar, planejar e implementar a mesma
 `B2C-1234` mantêm a conversa. Ao passar para `B2C-5678`, o funcionário inicia outra
 conversa, carregando identidade, alma, lembranças e orientações atuais. O gerente
-mantém sua conversa de coordenação. Sem código a conversa é preservada por padrão;
+mantém uma conversa por task, retomada pelo seletor do terminal. Sem código a conversa é preservada por padrão;
 `freshContext: true` serve para uma demanda independente sem código. Itens antigos
 continuam mantendo contexto.
 
@@ -432,3 +439,13 @@ próxima tarefa e troca de conversa. `done` é rejeitado enquanto houver steps n
 concluídos ou atribuições queued/running/uncertain. Reabrir uma tarefa exige uma
 atualização explícita; uma nova atribuição a insere novamente ao fim da fila.
 Consultas e atualizações sem `taskCode` preservam a visão geral da sala existente.
+
+## Conversas do gerente por tarefa
+
+No terminal do gerente, o dropdown à esquerda de **Encerrar processo** seleciona **Geral** ou uma task. **+ Outra task…** aceita o código e abre a conversa correspondente; se ainda não existir, registra a task local e inicia uma conversa vazia. Não cria arquivos ou worktrees. Trocar de task guarda a sessão atual e retoma o histórico da selecionada, inclusive após reabrir o aplicativo. A conversa anterior à atualização fica em Geral.
+
+A troca fica disponível durante turnos ativos, perguntas, resultados incertos ou pausa; só é bloqueada enquanto outra troca está sendo aplicada. O chat anterior mantém seu servidor e seu turno em segundo plano. Ao voltar, a tela reconecta à mesma sessão, com a pergunta e o resultado da conversa de origem. O dropdown indica chats em andamento ou com pergunta pendente. Selecionar uma conversa pausada a disponibiliza novamente. O botão de nova conversa reinicia somente a conversa selecionada, desde que ela esteja disponível e sem execução/pergunta pendente. Alma, memória, tarefas e histórico das outras conversas são preservados. Retornos de funcionários mantêm a task de origem e aguardam sua seleção; o dropdown mostra quantos estão pendentes. Nenhuma troca automática tira o usuário da task atual.
+
+Retornos recebidos enquanto outra conversa está selecionada ficam persistidos na fila da task de origem, inclusive com o gerente pausado, em revisão de treinamento ou com mais de dez retornos pendentes. A conclusão do funcionário e o retorno ao gerente são gravados juntos; repetir o evento não duplica a mensagem. Reabrir o aplicativo preserva essa fila. Ao selecionar a task, o gerente processa seus retornos em ordem quando estiver disponível.
+
+A lixeira ao lado do seletor pede confirmação para excluir a conversa selecionada do KanashaTerminal. Ao excluir uma task, retorna para Geral; abrir novamente seu código inicia outra conversa. Tasks, arquivos, memória e retornos pendentes são preservados. Chats excluídos saem da lista, mas tarefas com retornos pendentes continuam visíveis. Excluir Geral inicia uma conversa vazia. O histórico original armazenado pelo Codex não é apagado. A exclusão fica bloqueada durante execução, pausa, perguntas e resultados incertos.

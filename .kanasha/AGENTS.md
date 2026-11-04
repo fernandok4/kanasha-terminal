@@ -52,7 +52,7 @@ A aplicação fornece este conteúdo ao iniciar/retomar sessões: se já recebid
    não sincroniza funcionários: revisão exige uma entrega estável; QA, versão testável.
 5. Mesma `taskCode` preserva a conversa entre análise, plano, implementação e revisão.
    A troca de código abre conversa nova do funcionário, preservando alma, memória,
-   arquivos, histórico e fila. O gerente mantém sua conversa. `reset_context` serve
+   arquivos, histórico e fila. O gerente mantém uma conversa por tarefa, selecionada no dropdown do terminal; Geral é separada. Trocar de chat preserva o turno e as perguntas da conversa anterior em segundo plano. Retornos de outras tarefas aguardam a conversa correspondente. `reset_context` serve
    para outro funcionário ocioso, sem pergunta/execução incerta, nunca entre steps.
 6. Use `requestId` único por pedido. Após resposta incerta, consulte antes de repetir
    os mesmos argumentos e ID; nunca duplique uma operação às cegas.

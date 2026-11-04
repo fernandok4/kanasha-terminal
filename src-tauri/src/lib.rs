@@ -5,6 +5,7 @@ mod deliveries;
 mod delivery_git;
 mod execution;
 mod learning;
+mod manager_conversations;
 mod mcp;
 mod models;
 mod office;
@@ -53,6 +54,9 @@ pub struct AppState {
     state_path: PathBuf,
     persisted: Arc<Mutex<PersistedState>>,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    pty_generations: Arc<Mutex<HashMap<String, String>>>,
+    background_conversations:
+        Arc<Mutex<HashMap<(String, String), manager_conversations::BackgroundConversation>>>,
     agent_states: Arc<Mutex<HashMap<String, AgentState>>>,
     runtime_profiles: Arc<Mutex<HashMap<String, RuntimeProfile>>>,
     office_sessions: Arc<Mutex<HashMap<String, Arc<codex::CodexSession>>>>,
@@ -114,6 +118,8 @@ impl AppState {
             state_path,
             persisted: Arc::new(Mutex::new(persisted)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pty_generations: Arc::new(Mutex::new(HashMap::new())),
+            background_conversations: Arc::new(Mutex::new(HashMap::new())),
             agent_states: Arc::new(Mutex::new(HashMap::new())),
             runtime_profiles: Arc::new(Mutex::new(HashMap::new())),
             office_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -133,6 +139,19 @@ impl AppState {
         let active_terminal_ids = guard(&self.sessions)?.keys().cloned().collect();
         let agent_states = guard(&self.agent_states)?.clone();
         let mut member_states = guard(&self.member_states)?.clone();
+        for ((id, code), background) in guard(&self.background_conversations)?.iter() {
+            member_states
+                .entry(id.clone())
+                .or_default()
+                .background_conversations
+                .insert(
+                    code.clone(),
+                    models::ConversationActivity {
+                        working: background.runtime.turn_id.is_some(),
+                        waiting: background.runtime.request.is_some(),
+                    },
+                );
+        }
         for area in &persisted.areas {
             if !area
                 .workspaces
@@ -199,6 +218,10 @@ impl AppState {
         if area.workspaces.iter().flat_map(|w| &w.panels).any(|p| {
             guard(&self.sessions).is_ok_and(|s| s.contains_key(&p.id))
                 || guard(&self.office_sessions).is_ok_and(|s| s.contains_key(&p.id))
+                || guard(&self.background_conversations).is_ok_and(|s| {
+                    s.iter()
+                        .any(|((id, _), bg)| id == &p.id && bg.session.is_some())
+                })
         }) {
             return Err(
                 "Encerre os terminais da área antes de mudar a pasta-raiz e suas instruções."
@@ -730,6 +753,9 @@ impl AppState {
             .map(|s| s.connection_id.clone());
         let output_connection_id = connection_id.clone();
         let output_state = self.clone();
+        let pty_generation = new_id();
+        guard(&self.pty_generations)?.insert(terminal_id.into(), pty_generation.clone());
+        let output_generation = pty_generation.clone();
         let session = start_pty(
             &spec.executable,
             &spec.arguments,
@@ -738,6 +764,13 @@ impl AppState {
             move |data| {
                 // Hold the generation check through emit so a reset cannot publish
                 // its screen barrier before these old bytes are submitted.
+                let generations = match output_state.pty_generations.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if generations.get(&output_id) != Some(&output_generation) {
+                    return;
+                }
                 let output_sessions = if is_member {
                     match output_state.office_sessions.lock() {
                         Ok(sessions) => Some(sessions),
@@ -765,6 +798,13 @@ impl AppState {
                     Ok(gate) => gate,
                     Err(_) => return,
                 };
+                if guard(&exit_state.pty_generations)
+                    .ok()
+                    .and_then(|g| g.get(&exit_id).cloned())
+                    != Some(pty_generation)
+                {
+                    return;
+                }
                 if is_member
                     && exit_state
                         .office_sessions
@@ -795,13 +835,9 @@ impl AppState {
         let session = match session {
             Ok(session) => session,
             Err(error) => {
-                if is_member {
-                    // Startup failed before a turn. Keep pending work and the saved
-                    // new-chat checkpoint available for an explicit retry.
-                    guard(&self.office_sessions)?.remove(terminal_id);
-                    guard(&self.member_states)?.remove(terminal_id);
-                    guard(&self.member_tokens)?.remove(terminal_id);
-                }
+                // A restored conversation may have a live turn. Failure to open
+                // its display must not terminate that independent server.
+                guard(&self.pty_generations)?.remove(terminal_id);
                 return Err(error);
             }
         };
@@ -834,6 +870,7 @@ impl AppState {
 
     fn stop_terminal(&self, terminal_id: &str) -> Result<AppSnapshot, String> {
         let _terminal_gate = guard(&self.terminal_gate)?;
+        guard(&self.pty_generations)?.remove(terminal_id);
         self.close_member_session(terminal_id)?;
         let session = guard(&self.sessions)?.remove(terminal_id);
         if let Some(mut session) = session {
@@ -968,6 +1005,12 @@ impl AppState {
                 .is_ok_and(|sessions| sessions.contains_key(id))
         }) {
             return Err("Há sessões de equipe ativas. Encerre-as antes de remover.".into());
+        }
+        if guard(&self.background_conversations)?
+            .iter()
+            .any(|((id, _), bg)| ids.contains(id) && bg.session.is_some())
+        {
+            return Err("Há conversas em segundo plano. Selecione e encerre essas conversas antes de remover.".into());
         }
         Ok(())
     }
@@ -1264,7 +1307,13 @@ fn codex_mcp_arguments() -> Result<Vec<String>, String> {
         "-c".into(),
         "mcp_servers.kanasha_terminal.env_vars=[\"KANASHA_MCP_SOCKET\",\"KANASHA_MCP_TOKEN\",\"KANASHA_WORKSPACE_ID\",\"KANASHA_TERMINAL_ID\"]".into(),
         "-c".into(),
-        "mcp_servers.kanasha_terminal.enabled_tools=[\"get_task\",\"get_task_steps\",\"set_task\"]".into(),
+        "mcp_servers.kanasha_terminal.tools.get_workspace_summary.output_token_limit=12288".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.get_workspace_steps.output_token_limit=8192".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.update_workspace_summary.output_token_limit=1024".into(),
+        "-c".into(),
+        "mcp_servers.kanasha_terminal.tools.update_workspace_summary.approval_mode=\"approve\"".into(),
         "-c".into(),
         "mcp_servers.kanasha_terminal.tools.get_task.output_token_limit=12288".into(),
         "-c".into(),
@@ -1595,6 +1644,8 @@ pub fn run() {
             office::assign_agent,
             office::interrupt_agent,
             office::reset_agent_context,
+            manager_conversations::select_manager_conversation,
+            manager_conversations::delete_manager_conversation,
             office::answer_agent,
             learning::set_agent_memory,
             soul::set_agent_soul,
@@ -1607,6 +1658,9 @@ pub fn run() {
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(mut backgrounds) = state.background_conversations.lock() {
+                        backgrounds.clear();
+                    }
                     if let Ok(mut sessions) = state.office_sessions.lock() {
                         sessions.clear();
                     }
@@ -1662,10 +1716,9 @@ mod tests {
             arguments.first().map(String::as_str),
             Some("--dangerously-bypass-approvals-and-sandbox")
         );
-        assert!(arguments
+        assert!(!arguments
             .iter()
-            .any(|argument| argument
-                == "mcp_servers.kanasha_terminal.enabled_tools=[\"get_task\",\"get_task_steps\",\"set_task\"]"));
+            .any(|argument| argument.starts_with("mcp_servers.kanasha_terminal.enabled_tools=")));
         assert!(arguments.iter().any(|argument| {
             argument == "mcp_servers.kanasha_terminal.tools.get_task.output_token_limit=12288"
         }));

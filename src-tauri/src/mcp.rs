@@ -97,12 +97,23 @@ fn handle_ipc(mut stream: std::os::unix::net::UnixStream, state: &AppState, app:
         }
         let request: IpcRequest = serde_json::from_str(&line)
             .map_err(|error| format!("A solicitação MCP é inválida: {error}"))?;
-        if !state.valid_mcp_token(&request.terminal_id, &request.token)? {
-            return Err("A solicitação MCP não foi autorizada.".into());
+        let catalog = authorize_request(state, &request)?;
+        if request.tool.as_deref() == Some("__tools_list") {
+            return Ok(IpcResponse { ok: true, context: None, data: Some(catalog), error: None });
         }
         if let Some(tool) = request.tool.as_deref() {
             let arguments = request.arguments.unwrap_or_else(|| json!({}));
             let data = match tool {
+                "get_workspace_summary" | "get_workspace_steps" | "update_workspace_summary" => {
+                    let data = summary_call(state, &request.workspace_id, &request.terminal_id, tool, arguments)?;
+                    if tool == "update_workspace_summary" { let _ = app.emit("task-state-changed", &request.workspace_id); }
+                    data
+                }
+                "get_task" | "get_task_steps" | "set_task" if arguments.get("taskCode").is_none() => {
+                    let data = summary_call(state, &request.workspace_id, &request.terminal_id, tool, arguments)?;
+                    if tool == "set_task" { let _ = app.emit("task-state-changed", &request.workspace_id); }
+                    data
+                }
                 "get_tasks" if arguments.as_object().is_some_and(|o| o.is_empty()) => {
                     state.issue_tasks_context(&request.workspace_id, &request.terminal_id)?
                 }
@@ -256,21 +267,7 @@ fn handle_ipc(mut stream: std::os::unix::net::UnixStream, state: &AppState, app:
                 error: None,
             });
         }
-        let changed = request
-            .patch
-            .as_ref()
-            .is_some_and(|patch| !patch.is_empty());
-        let context =
-            state.task_context(&request.workspace_id, &request.terminal_id, request.patch)?;
-        if changed {
-            let _ = app.emit("task-state-changed", &request.workspace_id);
-        }
-        Ok(IpcResponse {
-            ok: true,
-            context: Some(context),
-            data: None,
-            error: None,
-        })
+        Err("Informe uma ferramenta MCP válida.".into())
     })()
     .unwrap_or_else(|error| IpcResponse {
         ok: false,
@@ -327,11 +324,14 @@ fn handle_rpc(request: Value) -> Option<Value> {
                 "protocolVersion": "2025-06-18",
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "kanasha-terminal", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("Leia get_task ao iniciar e get_task_steps quando precisar das etapas. {SUMMARY_GUIDANCE} Use set_task para atualizar somente campos alterados; mantenha summary atualizado nas mudanças de escopo, implementação, validação e publicação. Envie agentStatus=working ao começar; atualize agentCurrent ao mudar de etapa; use waiting, blocked, done ou idle nas transições. Registre etapas em steps e atualize seus estados com stepStatus.")
+                "instructions": format!("Consulte tools/list: o catálogo é definido pelo tipo salvo do Workspace. Use somente as ferramentas anunciadas e seus schemas. Consulte o resumo antes de atualizar somente os campos alterados. {SUMMARY_GUIDANCE} Mantenha a atividade e as etapas atualizadas nas transições relevantes.")
             }),
         )),
         "ping" => Some(rpc_result(id, json!({}))),
-        "tools/list" => Some(rpc_result(id, tools_list())),
+        "tools/list" => Some(match call_ipc(None, Some("__tools_list".into()), None) {
+            Ok(response) => rpc_result(id, response.data.unwrap_or_else(|| json!({"tools":[]}))),
+            Err(error) => rpc_error(id, -32000, &error),
+        }),
         "tools/call" => Some(rpc_result(id, call_tool(request.get("params")))),
         _ => Some(rpc_error(id, -32601, "Método MCP não encontrado.")),
     }
@@ -477,84 +477,146 @@ fn call_tool(params: Option<&Value>) -> Value {
     let Some(params) = params else {
         return tool_error("Os parâmetros da ferramenta não foram informados.");
     };
-    let name = params.get("name").and_then(Value::as_str);
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return tool_error("Ferramenta MCP desconhecida.");
+    };
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if matches!(
-        name,
-        Some(
-            "get_team"
-                | "get_agent"
-                | "get_tasks"
-                | "set_assignment"
-                | "reset_context"
-                | "release_task"
-                | "register_work_context"
-                | "submit_delivery"
-                | "get_deliveries"
-                | "review_delivery"
-                | "get_memory"
-                | "set_memory"
-                | "get_soul"
-                | "set_soul"
-                | "set_professional_profile"
-                | "set_training_complete"
-        )
-    ) {
-        return match call_ipc(None, name.map(str::to_owned), Some(arguments)) {
-            Ok(response) => tool_result(response.data.unwrap_or(Value::Null)),
-            Err(error) => tool_error(&error),
-        };
-    }
-    if matches!(name, Some("get_task" | "get_task_steps")) {
-        if !arguments
-            .as_object()
-            .is_some_and(|object| object.is_empty())
-        {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            struct Query {
-                task_code: String,
-            }
-            match serde_json::from_value::<Query>(arguments.clone()) {
-                Ok(query) if !query.task_code.trim().is_empty() => (),
-                _ => return tool_error("Esta consulta não aceita parâmetros."),
-            }
-            return match call_ipc(None, name.map(str::to_owned), Some(arguments)) {
-                Ok(response) => tool_result(response.data.unwrap_or(Value::Null)),
-                Err(error) => tool_error(&error),
-            };
-        }
-        return match call_app(None) {
-            Ok(context) if name == Some("get_task") => tool_result(get_task_payload(context)),
-            Ok(context) => tool_result(get_task_steps_payload(context)),
-            Err(error) => tool_error(&error),
-        };
-    }
-    if name != Some("set_task") {
+    let known = tools_list()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == name)
+        || matches!(
+            name,
+            "get_workspace_summary" | "get_workspace_steps" | "update_workspace_summary"
+        );
+    if !known {
         return tool_error("Ferramenta MCP desconhecida.");
     }
-    if arguments.get("taskCode").is_some() {
-        if let Err(error) = scoped_task_patch(arguments.clone()) {
+    if matches!(
+        name,
+        "get_task"
+            | "get_task_steps"
+            | "set_task"
+            | "get_workspace_summary"
+            | "get_workspace_steps"
+            | "update_workspace_summary"
+    ) {
+        if let Err(error) = validate_summary_arguments(name, &arguments) {
             return tool_error(&error);
         }
-        return match call_ipc(None, Some("set_task".into()), Some(arguments)) {
-            Ok(response) => tool_result(response.data.unwrap_or(Value::Null)),
-            Err(error) => tool_error(&error),
-        };
     }
-    let patch = match serde_json::from_value::<TaskPatch>(arguments) {
-        Ok(patch) => patch,
-        Err(error) => return tool_error(&format!("Parâmetros inválidos: {error}")),
-    };
-    if patch.is_empty() {
-        return tool_error("Informe ao menos um campo para atualizar a tarefa.");
-    }
-    match call_app(Some(patch)) {
-        Ok(_) => json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false }),
+    let plain_ack = matches!(name, "set_task" | "update_workspace_summary")
+        && arguments.get("taskCode").is_none();
+    match call_ipc(None, Some(name.into()), Some(arguments)) {
+        Ok(_) if plain_ack => json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
+        Ok(response) => tool_result(response.data.unwrap_or(Value::Null)),
         Err(error) => tool_error(&error),
+    }
+}
+
+fn workspace_tools(kind: crate::models::WorkspaceKind) -> Value {
+    let mut catalog = tools_list();
+    if kind == crate::models::WorkspaceKind::Normal {
+        let tools = catalog["tools"].as_array_mut().unwrap();
+        tools.truncate(3);
+        for (tool, (name, description)) in tools.iter_mut().zip([
+            ("get_workspace_summary", "Consulta status, resumo, andamento e revisão deste workspace normal, sem etapas. Não altera dados."),
+            ("get_workspace_steps", "Consulta as etapas do resumo deste workspace normal e sua revisão. Não altera dados."),
+            ("update_workspace_summary", "Atualiza somente os campos enviados do resumo, etapas e atividade do terminal neste workspace normal. Não cria tarefas por código nem coordena equipe."),
+        ]) {
+            tool["name"] = json!(name);
+            tool["description"] = json!(description);
+            tool["inputSchema"]["properties"].as_object_mut().unwrap().remove("taskCode");
+        }
+    }
+    catalog
+}
+
+// The application's saved workspace and authenticated panel decide the scope,
+// never a client-provided kind or a CLI allowlist.
+fn authorize_request(state: &AppState, request: &IpcRequest) -> Result<Value, String> {
+    if !state.valid_mcp_token(&request.terminal_id, &request.token)? {
+        return Err("A solicitação MCP não foi autorizada.".into());
+    }
+    let persisted = crate::guard(&state.persisted)?;
+    let workspace = crate::find_workspace(&persisted, &request.workspace_id)?;
+    if workspace.panel(&request.terminal_id).is_none() {
+        return Err("O terminal não pertence a este Workspace.".into());
+    }
+    if request.patch.is_some() {
+        return Err("Use uma ferramenta anunciada para atualizar o Workspace.".into());
+    }
+    let catalog = workspace_tools(workspace.kind);
+    let tool = request
+        .tool
+        .as_deref()
+        .ok_or("Informe uma ferramenta MCP válida.")?;
+    if tool != "__tools_list"
+        && !catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == tool)
+    {
+        return Err(
+            "Esta ferramenta não está disponível para o tipo deste Workspace. Consulte tools/list."
+                .into(),
+        );
+    }
+    Ok(catalog)
+}
+
+fn validate_summary_arguments(tool: &str, arguments: &Value) -> Result<(), String> {
+    let is_team_tool = matches!(tool, "get_task" | "get_task_steps" | "set_task");
+    if matches!(tool, "set_task" | "update_workspace_summary") {
+        if is_team_tool && arguments.get("taskCode").is_some() {
+            scoped_task_patch(arguments.clone())?;
+        } else {
+            let patch: TaskPatch = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Parâmetros inválidos: {e}"))?;
+            if patch.is_empty() {
+                return Err("Informe ao menos um campo para atualizar a tarefa.".into());
+            }
+        }
+    } else if !arguments.as_object().is_some_and(|o| o.is_empty()) {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Query {
+            task_code: String,
+        }
+        let query = serde_json::from_value::<Query>(arguments.clone());
+        if !is_team_tool || !query.is_ok_and(|q| !q.task_code.trim().is_empty()) {
+            return Err("Esta consulta não aceita parâmetros.".into());
+        }
+    }
+    Ok(())
+}
+
+fn summary_call(
+    state: &AppState,
+    workspace: &str,
+    terminal: &str,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    validate_summary_arguments(tool, &arguments)?;
+    if matches!(tool, "set_task" | "update_workspace_summary") {
+        let patch: TaskPatch = serde_json::from_value(arguments).map_err(|e| e.to_string())?;
+        state.task_context(workspace, terminal, Some(patch))?;
+        Ok(json!({"ok":true}))
+    } else {
+        let context = state.task_context(workspace, terminal, None)?;
+        Ok(
+            if matches!(tool, "get_task_steps" | "get_workspace_steps") {
+                get_task_steps_payload(context)
+            } else {
+                get_task_payload(context)
+            },
+        )
     }
 }
 
@@ -599,12 +661,6 @@ fn tool_result(payload: Value) -> Value {
         "content": [{ "type": "text", "text": payload.to_string() }],
         "isError": false
     })
-}
-
-fn call_app(patch: Option<TaskPatch>) -> Result<TaskContext, String> {
-    call_ipc(patch, None, None)?
-        .context
-        .ok_or_else(|| "O KanashaTerminal não retornou o contexto da tarefa.".into())
 }
 
 #[cfg(unix)]
@@ -694,6 +750,186 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_catalog_only_exposes_summary_tools_without_task_codes() {
+        let catalog = workspace_tools(crate::models::WorkspaceKind::Normal);
+        let tools = catalog["tools"].as_array().unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "get_workspace_summary",
+                "get_workspace_steps",
+                "update_workspace_summary"
+            ]
+        );
+        for tool in tools {
+            assert!(tool["inputSchema"]["properties"].get("taskCode").is_none());
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(validate_summary_arguments(
+                tool["name"].as_str().unwrap(),
+                &json!({"taskCode":"B2C-1"})
+            )
+            .is_err());
+        }
+        assert_eq!(
+            workspace_tools(crate::models::WorkspaceKind::Team),
+            tools_list()
+        );
+    }
+
+    #[test]
+    fn backend_authorizes_catalog_and_calls_from_saved_workspace_and_preserves_summary() {
+        use crate::models::*;
+        let root = std::env::temp_dir().join(format!("kanasha-mcp-scope-{}", new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        let state = AppState::load(path.clone()).unwrap();
+        let initial = state
+            .create_area(CreateAreaInput {
+                name: "Área".into(),
+                root_path: root.to_string_lossy().into(),
+                workspace_kind: WorkspaceKind::Normal,
+            })
+            .unwrap();
+        let area_id = initial.areas[0].id.clone();
+        let normal_id = initial.areas[0].workspaces[0].id.clone();
+        let initial = state
+            .create_terminal(CreateTerminalInput {
+                workspace_id: normal_id.clone(),
+                profile_id: "shell".into(),
+                title: None,
+                target_panel_id: None,
+                direction: None,
+            })
+            .unwrap();
+        let normal_terminal = initial.areas[0].workspaces[0].panels[0].id.clone();
+        let mut request = IpcRequest {
+            token: state.mcp_token.clone(),
+            workspace_id: normal_id.clone(),
+            terminal_id: normal_terminal.clone(),
+            patch: None,
+            tool: Some("__tools_list".into()),
+            arguments: None,
+        };
+        assert_eq!(
+            authorize_request(&state, &request).unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let before = state.snapshot().unwrap();
+        for tool in tools_list()["tools"].as_array().unwrap() {
+            request.tool = Some(tool["name"].as_str().unwrap().into());
+            request.arguments = Some(json!({"workspaceKind":"team"}));
+            assert!(
+                authorize_request(&state, &request).is_err(),
+                "normal accepted {}",
+                tool["name"]
+            );
+        }
+        assert_eq!(state.snapshot().unwrap().areas, before.areas);
+        request.tool = Some("update_workspace_summary".into());
+        request.arguments = Some(
+            json!({"summary":"Resumo preservado", "steps":[{"id":"verificar","title":"Verificar resultado","status":"in_progress"}], "agentStatus":"working"}),
+        );
+        authorize_request(&state, &request).unwrap();
+        summary_call(
+            &state,
+            &normal_id,
+            &normal_terminal,
+            request.tool.as_deref().unwrap(),
+            request.arguments.clone().unwrap(),
+        )
+        .unwrap();
+        let summary = summary_call(
+            &state,
+            &normal_id,
+            &normal_terminal,
+            "get_workspace_summary",
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(summary["summary"], "Resumo preservado");
+        assert!(summary.get("steps").is_none());
+        let steps = summary_call(
+            &state,
+            &normal_id,
+            &normal_terminal,
+            "get_workspace_steps",
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(steps["steps"][0]["id"], "verificar");
+        assert_eq!(summary["revision"], steps["revision"]);
+        assert!(summary_call(
+            &state,
+            &normal_id,
+            &normal_terminal,
+            "update_workspace_summary",
+            json!({"taskCode":"B2C-1", "summary":"inválido"})
+        )
+        .is_err());
+        assert_eq!(
+            AppState::load(path.clone())
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .areas[0]
+                .workspaces[0]
+                .task
+                .summary,
+            "Resumo preservado"
+        );
+        // The legacy unnamed patch cannot bypass the tool/type boundary.
+        request.tool = None;
+        request.patch = Some(TaskPatch {
+            summary: Some("bypass".into()),
+            ..Default::default()
+        });
+        assert!(authorize_request(&state, &request).is_err());
+        request.patch = None;
+        let with_team = state
+            .create_workspace(CreateWorkspaceInput {
+                area_id,
+                name: "Equipe".into(),
+                kind: WorkspaceKind::Team,
+            })
+            .unwrap();
+        let team = &with_team.areas[0].workspaces[1];
+        request.workspace_id = team.id.clone();
+        request.tool = Some("__tools_list".into());
+        // Valid token from a different workspace does not grant access.
+        assert!(authorize_request(&state, &request).is_err());
+        request.terminal_id = team.panels[0].id.clone();
+        assert!(authorize_request(&state, &request).is_err());
+        crate::guard(&state.member_tokens)
+            .unwrap()
+            .insert(request.terminal_id.clone(), "test-member-token".into());
+        request.token = "test-member-token".into();
+        assert_eq!(authorize_request(&state, &request).unwrap(), tools_list());
+        request.tool = Some("get_tasks".into());
+        authorize_request(&state, &request).unwrap();
+        request.tool = Some("update_workspace_summary".into());
+        assert!(authorize_request(&state, &request).is_err());
+        // Recheck the saved kind on every request, even for an existing identity.
+        crate::find_workspace_mut(&mut crate::guard(&state.persisted).unwrap(), &team.id)
+            .unwrap()
+            .kind = WorkspaceKind::Normal;
+        request.tool = Some("__tools_list".into());
+        assert_eq!(
+            authorize_request(&state, &request).unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn scoped_tasks_and_assignments_expose_real_step_relationships() {

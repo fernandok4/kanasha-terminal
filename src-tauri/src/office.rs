@@ -17,10 +17,20 @@ fn instructions(panel: &TerminalPanel, area: &area_instructions::Document) -> St
     } else {
         "Membro: execute a atribuição e registre a entrega. Use set_task apenas com agentStatus/agentCurrent para sua atividade. O resultado final chega automaticamente ao gerente."
     };
+    let conversation = if member.manager {
+        match &member.manager_task_code {
+            Some(code) => format!("Conversa exclusiva da tarefa {code}. Use taskCode={code} ao consultar/atualizar a tarefa e delegar seus steps. Não misture demandas de outras tarefas; o usuário troca a conversa pelo seletor do terminal."),
+            None => "Conversa Geral: treinamento e assuntos sem tarefa. Para trabalhar em uma task, o usuário seleciona seu código no terminal; cada task mantém seu próprio histórico.".into(),
+        }
+    } else {
+        String::new()
+    };
     format!(
         r#"# Sessão — {name}
 
 Função: {specialty}. {role}
+
+{conversation}
 
 ## Orientações do usuário
 
@@ -106,10 +116,9 @@ pub(crate) struct ReleaseTaskInput {
 
 fn next_assignment_index(room: &Workspace, member: &TeamMember) -> Option<usize> {
     if member.manager {
-        return member
-            .jobs
-            .iter()
-            .position(|j| j.status == AssignmentStatus::Queued);
+        return member.jobs.iter().position(|j| {
+            j.status == AssignmentStatus::Queued && j.task_code == member.manager_task_code
+        });
     }
     match current_queued_task(room, member) {
         Some(code) => member.jobs.iter().position(|job| {
@@ -212,7 +221,14 @@ impl AppState {
         if workspace.panel(terminal_id).unwrap().member.is_some() {
             Ok(guard(&self.member_tokens)?
                 .get(terminal_id)
-                .is_some_and(|expected| expected == token))
+                .is_some_and(|expected| expected == token)
+                || guard(&self.background_conversations)?
+                    .iter()
+                    .any(|((id, _), background)| {
+                        id == terminal_id
+                            && background.session.is_some()
+                            && background.token.as_deref() == Some(token)
+                    }))
         } else {
             Ok(token == self.mcp_token)
         }
@@ -231,7 +247,10 @@ impl AppState {
                     AssignmentStatus::Queued
                         | AssignmentStatus::Running
                         | AssignmentStatus::Uncertain
-                ) {
+                ) && (!member.manager
+                    || (job.task_code == member.manager_task_code
+                        && job.status != AssignmentStatus::Queued))
+                {
                     job.status = AssignmentStatus::Interrupted;
                     job.result =
                         "Execução encerrada. Uma nova atribuição exige um novo pedido.".into();
@@ -301,6 +320,9 @@ impl AppState {
                 label: None,
                 profile_id: CODEX.into(),
                 member: Some(TeamMember {
+                    manager_task_code: None,
+                    manager_conversations: HashMap::new(),
+                    deleted_manager_conversations: Vec::new(),
                     execution,
                     professional_profile: None,
                     automatic_name: input.name.trim().is_empty(),
@@ -412,7 +434,7 @@ impl AppState {
             &session_instructions,
             Some(&member.execution),
             move |event| {
-                if let Err(error) = state.member_event(&app_for_event, &id, event) {
+                if let Err(error) = state.member_event(Some(&app_for_event), &id, event) {
                     eprintln!("Kanasha equipe: {error}");
                 }
             },
@@ -427,7 +449,8 @@ impl AppState {
                             j.status,
                             AssignmentStatus::Queued | AssignmentStatus::Interrupted
                         )
-                }) && error.contains("no rollout found") =>
+                }) && !(member.manager && member.manager_task_code.is_some())
+                    && error.contains("no rollout found") =>
             {
                 let state = self.clone();
                 let app_for_event = app.clone();
@@ -440,7 +463,7 @@ impl AppState {
                     &session_instructions,
                     Some(&member.execution),
                     move |event| {
-                        let _ = state.member_event(&app_for_event, &id, event);
+                        let _ = state.member_event(Some(&app_for_event), &id, event);
                     },
                 )?
             }
@@ -574,10 +597,10 @@ impl AppState {
             }
             if let Some(code) = &task_code {
                 let room = find_terminal_workspace(&persisted, &input.terminal_id)?.1;
-                if room
-                    .tasks
-                    .iter()
-                    .any(|task| &task.task_code == code && task.state.status == TaskStatus::Done)
+                if !member.manager
+                    && room.tasks.iter().any(|task| {
+                        &task.task_code == code && task.state.status == TaskStatus::Done
+                    })
                 {
                     return Err("Esta tarefa já foi concluída. O gerente deve reabri-la com set_task antes de enfileirar trabalho novo.".into());
                 }
@@ -753,7 +776,7 @@ impl AppState {
             matches!(
                 j.status,
                 AssignmentStatus::Running | AssignmentStatus::Uncertain
-            )
+            ) && (!member.manager || j.task_code == member.manager_task_code)
         }) || guard(&self.member_states)?
             .get(terminal_id)
             .is_some_and(|r| r.turn_id.is_some() || r.request.is_some())
@@ -771,7 +794,11 @@ impl AppState {
                 return Ok(false);
             }
         }
-        let manual_task_code = current_queued_task(room, member).map(str::to_owned);
+        let manual_task_code = if member.manager {
+            member.manager_task_code.clone()
+        } else {
+            current_queued_task(room, member).map(str::to_owned)
+        };
         let mut candidate = persisted.clone();
         let member = find_terminal_mut(&mut candidate, terminal_id)?
             .member
@@ -794,6 +821,17 @@ impl AppState {
         self.save(&candidate)?;
         *persisted = candidate;
         drop(persisted);
+        self.disconnect_conversation(app, terminal_id)?;
+        Ok(true)
+    }
+
+    // Caller holds terminal_gate and office_gate; persisted changes are saved first.
+    pub(crate) fn disconnect_conversation(
+        &self,
+        app: Option<&AppHandle>,
+        terminal_id: &str,
+    ) -> Result<(), String> {
+        guard(&self.pty_generations)?.remove(terminal_id);
         // Removing the connection first fences late Codex events and PTY exits.
         guard(&self.office_sessions)?.remove(terminal_id);
         guard(&self.member_states)?.remove(terminal_id);
@@ -812,7 +850,7 @@ impl AppState {
         if let Some(mut pty) = guard(&self.sessions)?.remove(terminal_id) {
             pty.stop()?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Release only this employee's participation; keep the shared task and history.
@@ -934,7 +972,7 @@ impl AppState {
                     matches!(
                         j.status,
                         AssignmentStatus::Running | AssignmentStatus::Uncertain
-                    )
+                    ) && (!member.manager || j.task_code == member.manager_task_code)
                 }) || guard(&self.member_states)?
                     .get(terminal_id)
                     .is_some_and(|r| r.turn_id.is_some() || r.request.is_some())
@@ -1014,7 +1052,7 @@ impl AppState {
                         matches!(
                             j.status,
                             AssignmentStatus::Running | AssignmentStatus::Uncertain
-                        )
+                        ) && (!member.manager || j.task_code == member.manager_task_code)
                     })
                 {
                     return Ok(());
@@ -1114,7 +1152,163 @@ impl AppState {
         let _ = app.emit("task-state-changed", terminal_id);
     }
 
-    fn member_event(&self, app: &AppHandle, terminal_id: &str, event: Value) -> Result<(), String> {
+    // Caller holds office_gate. No Codex session is needed to persist a return.
+    fn record_member_output(
+        &self,
+        terminal_id: &str,
+        method: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<Option<String>, String> {
+        let mut notification = None;
+        let mut persisted = guard(&self.persisted)?;
+        let mut candidate = persisted.clone();
+        let panel = find_terminal_mut(&mut candidate, terminal_id)?;
+        let title = panel.title.clone();
+        let member = panel.member.as_mut().ok_or("Membro não encontrado.")?;
+        let mut changed = false;
+        if let Some(job) = member.jobs.iter_mut().find(|j| {
+            j.status == AssignmentStatus::Running
+                && params["threadId"]
+                    .as_str()
+                    .is_none_or(|thread| j.thread_id.as_deref() == Some(thread))
+        }) {
+            let event_turn = params["turnId"]
+                .as_str()
+                .or_else(|| params["turn"]["id"].as_str());
+            if method == "kanasha/disconnected" {
+                job.status = AssignmentStatus::Uncertain;
+                job.result =
+                    "Conexão encerrada durante a execução. Confira o histórico antes de repetir."
+                        .into();
+                changed = true;
+            } else if event_turn == job.turn_id.as_deref() {
+                if method == "item/completed" && params["item"]["type"] == "agentMessage" {
+                    job.result = params["item"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(8000)
+                        .collect();
+                    changed = true;
+                } else if method == "turn/completed" {
+                    job.status = match params["turn"]["status"].as_str() {
+                        Some("completed") => AssignmentStatus::Done,
+                        Some("interrupted") => AssignmentStatus::Interrupted,
+                        _ => AssignmentStatus::Failed,
+                    };
+                    if job.status == AssignmentStatus::Failed {
+                        job.result = params["turn"]["error"]["message"]
+                            .as_str()
+                            .unwrap_or("A execução falhou.")
+                            .chars()
+                            .take(8000)
+                            .collect();
+                    }
+                    job.updated_at = now;
+                    if let Some(manager) = &job.assigned_by {
+                        notification = Some((manager.clone(), job.task_code.clone(), format!("result-{terminal_id}-{}", job.id), format!("Resultado da atribuição {} de {}. Estado da execução: {:?}. {} Consulte get_deliveries com terminalId={} e assignmentId={} antes de atualizar resumo, status ou Jira.\n\n{}", job.id, title, job.status, if job.deliveries.is_empty() { "Entrega estruturada não registrada; isso não comprova ausência de trabalho." } else { "Entrega estruturada disponível para conferência da versão atual." }, terminal_id, job.id, job.result)));
+                    }
+                    changed = true;
+                }
+            }
+        } else if method == "turn/completed"
+            && params["turn"]["status"] == "completed"
+            && member.training != TrainingState::Ready
+        {
+            let runtime = self.conversation_runtime(terminal_id, params["threadId"].as_str())?;
+            if learning::training_recorded(
+                member,
+                runtime.training_memory_revision_before,
+                runtime.training_soul_revision_before,
+            ) {
+                member.training = TrainingState::Review;
+                changed = true;
+            }
+        }
+        if changed {
+            if method == "turn/completed" || method == "kanasha/disconnected" {
+                learning::finish_training(member);
+            }
+            if let Some((manager, task_code, request_id, message)) = &notification {
+                let room = find_terminal_workspace(&candidate, terminal_id)?.1;
+                if !room
+                    .panel(manager)
+                    .is_some_and(|p| p.member.as_ref().is_some_and(|m| m.manager))
+                {
+                    return Err(
+                        "O gerente responsável pelo retorno não pertence mais à equipe.".into(),
+                    );
+                }
+                let manager = find_terminal_mut(&mut candidate, manager)?
+                    .member
+                    .as_mut()
+                    .unwrap();
+                // Results are durable inbox entries, not new work requests. Pausing,
+                // training and the ten-assignment limit must never discard them.
+                if !manager.jobs.iter().any(|job| &job.id == request_id) {
+                    manager.jobs.push(Assignment {
+                        id: request_id.clone(),
+                        task_code: task_code.clone(),
+                        message: message.clone(),
+                        assigned_by: None,
+                        status: AssignmentStatus::Queued,
+                        result: String::new(),
+                        created_at: now,
+                        updated_at: now,
+                        turn_id: None,
+                        thread_id: None,
+                        training: false,
+                        fresh_context: false,
+                        memory_revision_before: manager.memory.revision,
+                        soul_revision_before: manager.soul.revision,
+                        step_ids: Vec::new(),
+                        work_contexts: Vec::new(),
+                        deliveries: Vec::new(),
+                    });
+                }
+            }
+            // Commit the worker result and manager inbox together. Failed saves
+            // leave the in-memory assignment running, so replay can retry safely.
+            self.save(&candidate)?;
+            *persisted = candidate;
+        }
+        Ok(notification.map(|(manager, _, _, _)| manager))
+    }
+
+    fn conversation_runtime(
+        &self,
+        terminal_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<MemberRuntime, String> {
+        if let Some(thread_id) = thread_id {
+            if let Some(runtime) =
+                guard(&self.background_conversations)?
+                    .iter()
+                    .find_map(|((id, _), bg)| {
+                        (id == terminal_id
+                            && bg
+                                .session
+                                .as_ref()
+                                .is_some_and(|s| s.thread_id == thread_id))
+                        .then(|| bg.runtime.clone())
+                    })
+            {
+                return Ok(runtime);
+            }
+        }
+        Ok(guard(&self.member_states)?
+            .get(terminal_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn member_event(
+        &self,
+        app: Option<&AppHandle>,
+        terminal_id: &str,
+        event: Value,
+    ) -> Result<(), String> {
         let method = event["method"].as_str().unwrap_or("");
         if event.get("id").is_none()
             && !matches!(
@@ -1130,13 +1324,27 @@ impl AppState {
         }
         let _gate = guard(&self.office_gate)?;
         // Late shutdown events from an old connection must not overwrite a replacement.
-        let session = guard(&self.office_sessions)?.get(terminal_id).cloned();
-        let Some(session) = session else {
-            return Ok(());
+        let active = guard(&self.office_sessions)?.get(terminal_id).cloned();
+        let (session, background_key) = if let Some(session) =
+            active.filter(|s| event["_connection"].as_str() == Some(&s.connection_id))
+        {
+            (session, None)
+        } else {
+            let backgrounds = guard(&self.background_conversations)?;
+            let Some((key, session)) = backgrounds.iter().find_map(|(key, bg)| {
+                bg.session
+                    .as_ref()
+                    .filter(|session| {
+                        key.0 == terminal_id
+                            && event["_connection"].as_str() == Some(&session.connection_id)
+                    })
+                    .map(|s| (key.clone(), s.clone()))
+            }) else {
+                return Ok(());
+            };
+            (session, Some(key))
         };
-        if event["_connection"].as_str() != Some(&session.connection_id) {
-            return Ok(());
-        }
+        let mut runtime = self.conversation_runtime(terminal_id, Some(&session.thread_id))?;
         if let Some(id) = event.get("id") {
             if !matches!(
                 method,
@@ -1147,22 +1355,21 @@ impl AppState {
                 session.respond_error(id.clone(), "Esta interação ainda não é suportada pelo KanashaTerminal. Informe ao usuário o impedimento.")?;
                 return Ok(());
             }
-            if guard(&self.member_states)?
-                .get(terminal_id)
-                .is_some_and(|s| s.request.is_some())
-            {
+            if runtime.request.is_some() {
                 session.respond_error(id.clone(), "Já existe uma pergunta pendente. Aguarde sua resposta antes de solicitar outra.")?;
                 return Ok(());
             }
         }
+        let mut scoped_params = event["params"].clone();
         let params = &event["params"];
         if let Some(thread_id) = params["threadId"].as_str() {
             if thread_id != session.thread_id {
                 return Ok(());
             }
         }
+        scoped_params["threadId"] = json!(session.thread_id);
+        let params = &scoped_params;
         let now = unix_timestamp()?;
-        let mut notification = None;
         let mut next = false;
         let training_baseline = if method == "turn/started" {
             let persisted = guard(&self.persisted)?;
@@ -1179,8 +1386,7 @@ impl AppState {
             None
         };
         {
-            let mut states = guard(&self.member_states)?;
-            let state = states.entry(terminal_id.into()).or_default();
+            let state = &mut runtime;
             state.updated_at = now;
             match method {
                 "kanasha/disconnected" => {
@@ -1225,87 +1431,23 @@ impl AppState {
                 _ => {}
             }
         }
-        if matches!(
+        if let Some(key) = &background_key {
+            if let Some(background) = guard(&self.background_conversations)?.get_mut(key) {
+                background.runtime = runtime.clone();
+            }
+        } else {
+            guard(&self.member_states)?.insert(terminal_id.into(), runtime.clone());
+        }
+        let notification = if matches!(
             method,
             "turn/completed" | "item/completed" | "kanasha/disconnected"
         ) {
-            let mut persisted = guard(&self.persisted)?;
-            let panel = find_terminal_mut(&mut persisted, terminal_id)?;
-            let title = panel.title.clone();
-            let member = panel.member.as_mut().ok_or("Membro não encontrado.")?;
-            let mut changed = false;
-            if let Some(job) = member
-                .jobs
-                .iter_mut()
-                .find(|j| j.status == AssignmentStatus::Running)
-            {
-                let event_turn = params["turnId"]
-                    .as_str()
-                    .or_else(|| params["turn"]["id"].as_str());
-                if method == "kanasha/disconnected" {
-                    job.status = AssignmentStatus::Uncertain;
-                    job.result = "Conexão encerrada durante a execução. Confira o histórico antes de repetir.".into();
-                    changed = true;
-                } else if event_turn == job.turn_id.as_deref() {
-                    if method == "item/completed" && params["item"]["type"] == "agentMessage" {
-                        job.result = params["item"]["text"]
-                            .as_str()
-                            .unwrap_or("")
-                            .chars()
-                            .take(8000)
-                            .collect();
-                        changed = true;
-                    } else if method == "turn/completed" {
-                        job.status = match params["turn"]["status"].as_str() {
-                            Some("completed") => AssignmentStatus::Done,
-                            Some("interrupted") => AssignmentStatus::Interrupted,
-                            _ => AssignmentStatus::Failed,
-                        };
-                        if job.status == AssignmentStatus::Failed {
-                            job.result = params["turn"]["error"]["message"]
-                                .as_str()
-                                .unwrap_or("A execução falhou.")
-                                .chars()
-                                .take(8000)
-                                .collect();
-                        }
-                        job.updated_at = now;
-                        if let Some(manager) = &job.assigned_by {
-                            notification = Some((manager.clone(), format!("result-{terminal_id}-{}", job.id), format!("Resultado da atribuição {} de {}. Estado da execução: {:?}. {} Consulte get_deliveries com terminalId={} e assignmentId={} antes de atualizar resumo, status ou Jira.\n\n{}", job.id, title, job.status, if job.deliveries.is_empty() { "Entrega estruturada não registrada; isso não comprova ausência de trabalho." } else { "Entrega estruturada disponível para conferência da versão atual." }, terminal_id, job.id, job.result).chars().take(8000).collect::<String>()));
-                        }
-                        changed = true;
-                    }
-                }
-            } else if method == "turn/completed"
-                && params["turn"]["status"] == "completed"
-                && member.training != TrainingState::Ready
-            {
-                let runtime = guard(&self.member_states)?
-                    .get(terminal_id)
-                    .cloned()
-                    .unwrap_or_default();
-                if learning::training_recorded(
-                    member,
-                    runtime.training_memory_revision_before,
-                    runtime.training_soul_revision_before,
-                ) {
-                    member.training = TrainingState::Review;
-                    changed = true;
-                }
-            }
-            if changed {
-                if method == "turn/completed" || method == "kanasha/disconnected" {
-                    learning::finish_training(member);
-                }
-                self.save(&persisted)?;
-            }
-        }
-        // Mirror runtime status into the existing workspace indicators.
-        {
-            let runtime = guard(&self.member_states)?
-                .get(terminal_id)
-                .cloned()
-                .unwrap_or_default();
+            self.record_member_output(terminal_id, method, params, now)?
+        } else {
+            None
+        };
+        // Background events must not change the selected chat's status.
+        if background_key.is_none() {
             let mut states = guard(&self.agent_states)?;
             let state = states.entry(terminal_id.into()).or_default();
             state.status = if runtime.request.is_some() {
@@ -1319,25 +1461,14 @@ impl AppState {
             state.updated_at = now;
         }
         drop(_gate);
-        if let Some((manager, request_id, message)) = notification {
-            // Internal result delivery uses no assigned_by, preventing a reply loop.
-            let _ = self.assign_agent(
-                app,
-                AssignAgentInput {
-                    step_ids: Vec::new(),
-                    task_code: None,
-                    fresh_context: None,
-                    training: false,
-                    terminal_id: manager,
-                    request_id,
-                    message,
-                },
-                None,
-            );
-        }
-        let _ = app.emit("task-state-changed", terminal_id);
-        if next {
-            self.deliver_next(app, terminal_id);
+        if let Some(app) = app {
+            if let Some(manager) = notification {
+                self.wake_member(app, &manager);
+            }
+            let _ = app.emit("task-state-changed", terminal_id);
+            if next && background_key.is_none() {
+                self.deliver_next(app, terminal_id);
+            }
         }
         Ok(())
     }
@@ -1364,7 +1495,7 @@ impl AppState {
         if let Some(member) = &mut find_terminal_mut(&mut persisted, terminal_id)?.member {
             member.paused = true;
             for job in &mut member.jobs {
-                if job.status == AssignmentStatus::Queued {
+                if job.status == AssignmentStatus::Queued && !member.manager {
                     job.status = AssignmentStatus::Interrupted;
                     job.result = "Atribuição cancelada pelo usuário antes de iniciar.".into();
                     job.updated_at = unix_timestamp()?;
@@ -1381,11 +1512,16 @@ impl AppState {
         terminal_id: &str,
         request_id: Value,
         result: Value,
+        connection_id: &str,
     ) -> Result<AppSnapshot, String> {
+        let _gate = guard(&self.office_gate)?;
         let session = guard(&self.office_sessions)?
             .get(terminal_id)
             .cloned()
             .ok_or("A sessão não está conectada.")?;
+        if session.connection_id != connection_id {
+            return Err("A conversa mudou. Retorne ao chat da pergunta antes de responder.".into());
+        }
         let mut states = guard(&self.member_states)?;
         let state = states
             .get_mut(terminal_id)
@@ -1443,11 +1579,6 @@ impl AppState {
 
 fn office_mcp_arguments() -> Result<Vec<String>, String> {
     let mut args = codex_mcp_arguments()?;
-    for arg in &mut args {
-        if arg.starts_with("mcp_servers.kanasha_terminal.enabled_tools=") {
-            *arg = "mcp_servers.kanasha_terminal.enabled_tools=[\"get_task\",\"get_task_steps\",\"set_task\",\"get_team\",\"get_agent\",\"get_tasks\",\"set_assignment\",\"reset_context\",\"release_task\",\"register_work_context\",\"submit_delivery\",\"get_deliveries\",\"review_delivery\",\"get_memory\",\"get_soul\",\"set_memory\",\"set_soul\",\"set_professional_profile\",\"set_training_complete\"]".into();
-        }
-    }
     args.extend([
         "-c".into(),
         "mcp_servers.kanasha_terminal.tools.get_memory.output_token_limit=32768".into(),
@@ -1516,6 +1647,635 @@ mod tests {
             task_code: "B2C-X".into(),
             assignment_id: "deliver-X".into(),
         }
+    }
+
+    #[test]
+    fn manager_switch_keeps_background_turn_questions_tokens_and_results_scoped() {
+        let f = Fixture::new();
+        let mut sessions = Vec::new();
+        for code in ["B2C-X", "B2C-Y"] {
+            f.state
+                .prepare_manager_conversation(None, &f.manager, Some(code.into()))
+                .unwrap();
+            let mut input = f.assignment(code);
+            input.terminal_id = f.manager.clone();
+            input.task_code = Some(code.into());
+            f.state.enqueue_assignment(input, None).unwrap();
+            let session = Arc::new(CodexSession::test_session(code));
+            {
+                let mut p = guard(&f.state.persisted).unwrap();
+                let member = find_terminal_mut(&mut p, &f.manager)
+                    .unwrap()
+                    .member
+                    .as_mut()
+                    .unwrap();
+                member.thread_id = Some(code.into());
+                let job = member.jobs.last_mut().unwrap();
+                job.thread_id = Some(code.into());
+                job.turn_id = Some(format!("turn-{code}"));
+                job.status = AssignmentStatus::Running;
+            }
+            guard(&f.state.office_sessions)
+                .unwrap()
+                .insert(f.manager.clone(), session.clone());
+            guard(&f.state.member_tokens)
+                .unwrap()
+                .insert(f.manager.clone(), format!("token-{code}"));
+            guard(&f.state.member_states).unwrap().insert(
+                f.manager.clone(),
+                MemberRuntime {
+                    connected: true,
+                    turn_id: Some(format!("turn-{code}")),
+                    ..Default::default()
+                },
+            );
+            sessions.push(session);
+        }
+        assert!(f.state.valid_mcp_token(&f.manager, "token-B2C-X").unwrap());
+        assert!(f.state.valid_mcp_token(&f.manager, "token-B2C-Y").unwrap());
+        assert!(!f.state.valid_mcp_token(&f.manager, "invalid").unwrap());
+        let old_connection = &sessions[0].connection_id;
+        // A question from X arrives while Y is selected and running.
+        f.state.member_event(None, &f.manager, json!({"_connection":old_connection, "id":42,
+            "method":"item/tool/requestUserInput", "params":{"threadId":"B2C-X","turnId":"turn-B2C-X"}
+        })).unwrap();
+        let snap = f.state.snapshot().unwrap();
+        assert!(snap.member_states[&f.manager].request.is_none());
+        assert_eq!(
+            snap.member_states[&f.manager].turn_id.as_deref(),
+            Some("turn-B2C-Y")
+        );
+        assert!(snap.member_states[&f.manager].background_conversations["B2C-X"].waiting);
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &guard(&f.state.office_sessions).unwrap()[&f.manager],
+            &sessions[0]
+        ));
+        assert_eq!(
+            f.state.snapshot().unwrap().member_states[&f.manager]
+                .request
+                .as_ref()
+                .unwrap()["id"],
+            42
+        );
+        assert!(f
+            .state
+            .answer_agent(
+                &f.manager,
+                json!(42),
+                json!({"answers":{}}),
+                &sessions[1].connection_id
+            )
+            .is_err());
+        assert!(f.state.snapshot().unwrap().member_states[&f.manager]
+            .request
+            .is_some());
+        f.state
+            .answer_agent(&f.manager, json!(42), json!({"answers":{}}), old_connection)
+            .unwrap();
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-Y".into()))
+            .unwrap();
+        f.state.member_event(None, &f.manager, json!({"_connection":old_connection,
+            "method":"item/completed", "params":{"threadId":"B2C-X","turnId":"turn-B2C-X","item":{"type":"agentMessage","text":"RESULTADO_X"}}
+        })).unwrap();
+        f.state.member_event(None, &f.manager, json!({"_connection":old_connection,
+            "method":"turn/completed", "params":{"threadId":"B2C-X","turn":{"id":"turn-B2C-X","status":"completed"}}
+        })).unwrap();
+        let snap = f.state.snapshot().unwrap();
+        let member = snap.areas[0].workspaces[0].panels[0]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(member.manager_task_code.as_deref(), Some("B2C-Y"));
+        assert_eq!(member.jobs[0].status, AssignmentStatus::Done);
+        assert_eq!(member.jobs[0].result, "RESULTADO_X");
+        assert_eq!(member.jobs[1].status, AssignmentStatus::Running);
+        assert!(member.jobs[1].result.is_empty());
+        assert_eq!(
+            snap.member_states[&f.manager].turn_id.as_deref(),
+            Some("turn-B2C-Y")
+        );
+        // Old generations must not act on the selected or parked conversation.
+        f.state
+            .member_event(
+                None,
+                &f.manager,
+                json!({"_connection":"obsolete", "method":"kanasha/disconnected", "params":{}}),
+            )
+            .unwrap();
+        assert_eq!(
+            f.state.snapshot().unwrap().member_states[&f.manager]
+                .turn_id
+                .as_deref(),
+            Some("turn-B2C-Y")
+        );
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        // Closing X preserves the still-running Y and its authorization.
+        f.state.close_member_session(&f.manager).unwrap();
+        assert!(f.state.valid_mcp_token(&f.manager, "token-B2C-Y").unwrap());
+        assert!(!f.state.valid_mcp_token(&f.manager, "token-B2C-X").unwrap());
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-Y".into()))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &guard(&f.state.office_sessions).unwrap()[&f.manager],
+            &sessions[1]
+        ));
+        assert_eq!(
+            f.state.snapshot().unwrap().member_states[&f.manager]
+                .turn_id
+                .as_deref(),
+            Some("turn-B2C-Y")
+        );
+    }
+
+    #[test]
+    fn deleting_manager_chat_preserves_tasks_pending_results_and_other_chats() {
+        use crate::manager_conversations::DeleteConversationInput;
+        let f = Fixture::new();
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        let mut input = f.assignment("pending-result");
+        input.terminal_id = f.manager.clone();
+        input.task_code = Some("B2C-X".into());
+        f.state.enqueue_assignment(input, None).unwrap();
+        {
+            let mut p = guard(&f.state.persisted).unwrap();
+            let member = find_terminal_mut(&mut p, &f.manager)
+                .unwrap()
+                .member
+                .as_mut()
+                .unwrap();
+            member.thread_id = Some("thread-X".into());
+            for (key, thread) in [("", "general"), ("B2C-X", "old-X"), ("B2C-Y", "thread-Y")] {
+                member.manager_conversations.insert(
+                    key.into(),
+                    ManagerConversation {
+                        thread_id: Some(thread.into()),
+                        instructions_hash: None,
+                        paused: false,
+                    },
+                );
+            }
+            f.state.save(&p).unwrap();
+        }
+        let before = f.state.snapshot().unwrap();
+        let delete = DeleteConversationInput {
+            terminal_id: f.manager.clone(),
+            task_code: Some("B2C-X".into()),
+            expected_thread_id: Some("thread-X".into()),
+        };
+        f.state
+            .prepare_delete_manager_conversation(None, &delete)
+            .unwrap();
+        let restored = AppState::load(f.path.clone()).unwrap();
+        let snap = restored.snapshot().unwrap();
+        let room = &snap.areas[0].workspaces[0];
+        let member = room.panels[0].member.as_ref().unwrap();
+        assert_eq!(room.tasks, before.areas[0].workspaces[0].tasks);
+        assert_eq!(
+            member.jobs,
+            before.areas[0].workspaces[0].panels[0]
+                .member
+                .as_ref()
+                .unwrap()
+                .jobs
+        );
+        assert_eq!(member.thread_id.as_deref(), Some("general"));
+        assert!(member.manager_task_code.is_none());
+        assert!(!member.manager_conversations.contains_key("B2C-X"));
+        assert_eq!(
+            member.manager_conversations["B2C-Y"].thread_id.as_deref(),
+            Some("thread-Y")
+        );
+        assert_eq!(member.deleted_manager_conversations, vec!["B2C-X"]);
+        assert!(restored
+            .prepare_delete_manager_conversation(None, &delete)
+            .is_err());
+        restored
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        let snap = restored.snapshot().unwrap();
+        let member = snap.areas[0].workspaces[0].panels[0]
+            .member
+            .as_ref()
+            .unwrap();
+        assert!(member.thread_id.is_none());
+        assert!(member.deleted_manager_conversations.is_empty());
+        restored
+            .prepare_manager_conversation(None, &f.manager, None)
+            .unwrap();
+        restored
+            .prepare_delete_manager_conversation(
+                None,
+                &DeleteConversationInput {
+                    terminal_id: f.manager.clone(),
+                    task_code: None,
+                    expected_thread_id: Some("general".into()),
+                },
+            )
+            .unwrap();
+        let snap = restored.snapshot().unwrap();
+        let member = snap.areas[0].workspaces[0].panels[0]
+            .member
+            .as_ref()
+            .unwrap();
+        assert!(member.thread_id.is_none());
+        assert!(!member.manager_conversations.contains_key(""));
+        assert_eq!(member.jobs.len(), 1);
+    }
+
+    #[test]
+    fn deleting_manager_chat_rejects_stale_busy_and_failed_save_without_mutating() {
+        use crate::manager_conversations::DeleteConversationInput;
+        let f = Fixture::new();
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        let before = f.state.snapshot().unwrap().areas;
+        let mut input = DeleteConversationInput {
+            terminal_id: f.manager.clone(),
+            task_code: Some("B2C-Y".into()),
+            expected_thread_id: None,
+        };
+        assert!(f
+            .state
+            .prepare_delete_manager_conversation(None, &input)
+            .is_err());
+        input.task_code = Some("B2C-X".into());
+        input.expected_thread_id = Some("stale-thread".into());
+        assert!(f
+            .state
+            .prepare_delete_manager_conversation(None, &input)
+            .is_err());
+        input.expected_thread_id = None;
+        guard(&f.state.member_states).unwrap().insert(
+            f.manager.clone(),
+            MemberRuntime {
+                turn_id: Some("busy".into()),
+                ..Default::default()
+            },
+        );
+        assert!(f
+            .state
+            .prepare_delete_manager_conversation(None, &input)
+            .is_err());
+        guard(&f.state.member_states).unwrap().clear();
+        let backup = f.path.with_extension("backup");
+        fs::rename(&f.path, &backup).unwrap();
+        fs::create_dir(&f.path).unwrap();
+        assert!(f
+            .state
+            .prepare_delete_manager_conversation(None, &input)
+            .is_err());
+        assert_eq!(f.state.snapshot().unwrap().areas, before);
+        fs::remove_dir(&f.path).unwrap();
+        fs::rename(backup, &f.path).unwrap();
+    }
+
+    #[test]
+    fn inactive_manager_chat_keeps_every_result_across_pause_capacity_and_restart() {
+        let f = Fixture::new();
+        {
+            let mut p = guard(&f.state.persisted).unwrap();
+            find_terminal_mut(&mut p, &f.manager)
+                .unwrap()
+                .member
+                .as_mut()
+                .unwrap()
+                .paused = true;
+        }
+        for index in 0..12 {
+            let mut input = f.assignment(&format!("work-{index}"));
+            input.task_code = Some("B2C-X".into());
+            f.state
+                .enqueue_assignment(input, Some((&f.workspace, &f.manager)))
+                .unwrap();
+            {
+                let mut p = guard(&f.state.persisted).unwrap();
+                let worker = find_terminal_mut(&mut p, &f.worker)
+                    .unwrap()
+                    .member
+                    .as_mut()
+                    .unwrap();
+                let job = worker.jobs.last_mut().unwrap();
+                job.status = AssignmentStatus::Running;
+                job.turn_id = Some(format!("turn-{index}"));
+                if index == 11 {
+                    find_terminal_mut(&mut p, &f.manager)
+                        .unwrap()
+                        .member
+                        .as_mut()
+                        .unwrap()
+                        .training = TrainingState::Review;
+                }
+            }
+            let _gate = guard(&f.state.office_gate).unwrap();
+            f.state.record_member_output(&f.worker, "item/completed", &json!({
+                "turnId": format!("turn-{index}"),
+                "item": { "type": "agentMessage", "text": format!("Resultado completo {index}") }
+            }), 10).unwrap();
+            let event = json!({ "turn": { "id": format!("turn-{index}"), "status": "completed" } });
+            assert_eq!(
+                f.state
+                    .record_member_output(&f.worker, "turn/completed", &event, 11)
+                    .unwrap(),
+                Some(f.manager.clone())
+            );
+            // Replayed completion must not duplicate the inbox entry.
+            assert_eq!(
+                f.state
+                    .record_member_output(&f.worker, "turn/completed", &event, 11)
+                    .unwrap(),
+                None
+            );
+        }
+        let restored = AppState::load(f.path.clone()).unwrap();
+        {
+            let mut p = guard(&restored.persisted).unwrap();
+            let room = find_workspace(&p, &f.workspace).unwrap();
+            let manager = room.panel(&f.manager).unwrap().member.as_ref().unwrap();
+            assert!(manager.paused);
+            assert_eq!(manager.training, TrainingState::Review);
+            assert_eq!(manager.jobs.len(), 12);
+            assert!(manager.manager_task_code.is_none());
+            assert_eq!(next_assignment_index(room, manager), None);
+            for (index, job) in manager.jobs.iter().enumerate() {
+                assert_eq!(job.task_code.as_deref(), Some("B2C-X"));
+                assert_eq!(job.status, AssignmentStatus::Queued);
+                assert!(job
+                    .message
+                    .ends_with(&format!("Resultado completo {index}")));
+            }
+            let manager = find_terminal_mut(&mut p, &f.manager)
+                .unwrap()
+                .member
+                .as_mut()
+                .unwrap();
+            manager.paused = false;
+            manager.training = TrainingState::Ready;
+        }
+        restored
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        for index in 0..12 {
+            {
+                let mut p = guard(&restored.persisted).unwrap();
+                let room = find_workspace(&p, &f.workspace).unwrap();
+                let manager = room.panel(&f.manager).unwrap().member.as_ref().unwrap();
+                let next = next_assignment_index(room, manager).unwrap();
+                assert_eq!(next, index);
+                let job = &mut find_terminal_mut(&mut p, &f.manager)
+                    .unwrap()
+                    .member
+                    .as_mut()
+                    .unwrap()
+                    .jobs[next];
+                job.status = AssignmentStatus::Running;
+                job.turn_id = Some(format!("consume-{index}"));
+            }
+            let _gate = guard(&restored.office_gate).unwrap();
+            assert_eq!(
+                restored
+                    .record_member_output(
+                        &f.manager,
+                        "turn/completed",
+                        &json!({
+                            "turn": { "id": format!("consume-{index}"), "status": "completed" }
+                        }),
+                        12
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+        let p = guard(&restored.persisted).unwrap();
+        let room = find_workspace(&p, &f.workspace).unwrap();
+        let manager = room.panel(&f.manager).unwrap().member.as_ref().unwrap();
+        assert_eq!(manager.jobs.len(), 12);
+        assert_eq!(next_assignment_index(room, manager), None);
+    }
+
+    #[test]
+    fn worker_completion_and_manager_inbox_are_saved_atomically() {
+        let f = Fixture::new();
+        let mut input = f.assignment("atomic-result");
+        input.task_code = Some("B2C-X".into());
+        f.state
+            .enqueue_assignment(input, Some((&f.workspace, &f.manager)))
+            .unwrap();
+        {
+            let mut p = guard(&f.state.persisted).unwrap();
+            let job = &mut find_terminal_mut(&mut p, &f.worker)
+                .unwrap()
+                .member
+                .as_mut()
+                .unwrap()
+                .jobs[0];
+            job.status = AssignmentStatus::Running;
+            job.turn_id = Some("turn-atomic".into());
+            job.result = "Retorno preservado".into();
+            f.state.save(&p).unwrap();
+        }
+        let before = f.state.snapshot().unwrap().areas;
+        let backup = f.path.with_extension("backup");
+        fs::rename(&f.path, &backup).unwrap();
+        fs::create_dir(&f.path).unwrap();
+        let event = json!({ "turn": { "id": "turn-atomic", "status": "completed" } });
+        let _gate = guard(&f.state.office_gate).unwrap();
+        assert!(f
+            .state
+            .record_member_output(&f.worker, "turn/completed", &event, 10)
+            .is_err());
+        assert_eq!(f.state.snapshot().unwrap().areas, before);
+        fs::remove_dir(&f.path).unwrap();
+        fs::rename(backup, &f.path).unwrap();
+        f.state
+            .record_member_output(&f.worker, "turn/completed", &event, 10)
+            .unwrap();
+        let restored = AppState::load(f.path.clone()).unwrap();
+        let p = guard(&restored.persisted).unwrap();
+        let room = find_workspace(&p, &f.workspace).unwrap();
+        assert_eq!(
+            room.panel(&f.worker).unwrap().member.as_ref().unwrap().jobs[0].status,
+            AssignmentStatus::Done
+        );
+        let inbox = &room
+            .panel(&f.manager)
+            .unwrap()
+            .member
+            .as_ref()
+            .unwrap()
+            .jobs;
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].message.ends_with("Retorno preservado"));
+    }
+
+    #[test]
+    fn manager_task_conversations_restore_threads_and_keep_general_and_other_tasks() {
+        let f = Fixture::new();
+        let set_thread = |state: &AppState, thread: &str| {
+            let mut p = guard(&state.persisted).unwrap();
+            let m = find_terminal_mut(&mut p, &f.manager)
+                .unwrap()
+                .member
+                .as_mut()
+                .unwrap();
+            m.thread_id = Some(thread.into());
+            m.session_instructions_hash = Some(format!("hash-{thread}"));
+            state.save(&p).unwrap();
+        };
+        set_thread(&f.state, "general-thread");
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("b2c-x".into()))
+            .unwrap();
+        let current = f.state.snapshot().unwrap();
+        let m = current.areas[0].workspaces[0].panels[0]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(m.manager_task_code.as_deref(), Some("B2C-X"));
+        assert!(m.thread_id.is_none());
+        set_thread(&f.state, "thread-X");
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-Y".into()))
+            .unwrap();
+        set_thread(&f.state, "thread-Y");
+        let state = AppState::load(f.path.clone()).unwrap();
+        state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        let snap = state.snapshot().unwrap();
+        let m = snap.areas[0].workspaces[0].panels[0]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(m.thread_id.as_deref(), Some("thread-X"));
+        assert_eq!(
+            m.session_instructions_hash.as_deref(),
+            Some("hash-thread-X")
+        );
+        assert_eq!(
+            m.manager_conversations["B2C-Y"].thread_id.as_deref(),
+            Some("thread-Y")
+        );
+        assert!(!state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap());
+        // New conversation resets only the currently selected task.
+        state
+            .prepare_fresh_context(None, &f.manager, "new-X", None, None)
+            .unwrap();
+        set_thread(&state, "new-thread-X");
+        state
+            .prepare_manager_conversation(None, &f.manager, None)
+            .unwrap();
+        assert_eq!(
+            state.snapshot().unwrap().areas[0].workspaces[0].panels[0]
+                .member
+                .as_ref()
+                .unwrap()
+                .thread_id
+                .as_deref(),
+            Some("general-thread")
+        );
+        state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-Y".into()))
+            .unwrap();
+        assert_eq!(
+            state.snapshot().unwrap().areas[0].workspaces[0].panels[0]
+                .member
+                .as_ref()
+                .unwrap()
+                .thread_id
+                .as_deref(),
+            Some("thread-Y")
+        );
+        state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        let snap = state.snapshot().unwrap();
+        let room = &snap.areas[0].workspaces[0];
+        assert_eq!(
+            room.panels[0].member.as_ref().unwrap().thread_id.as_deref(),
+            Some("new-thread-X")
+        );
+        let duplicate = room.clone_for_duplicate();
+        let copied = duplicate.panels[0].member.as_ref().unwrap();
+        assert!(
+            copied.thread_id.is_none()
+                && copied.manager_task_code.is_none()
+                && copied.manager_conversations.is_empty()
+        );
+        assert_eq!(room.tasks.len(), 2);
+    }
+
+    #[test]
+    fn manager_task_switch_rejects_workers_and_failed_persistence() {
+        let f = Fixture::new();
+        let before = f.state.snapshot().unwrap().areas;
+        assert!(f
+            .state
+            .prepare_manager_conversation(None, &f.worker, Some("B2C-X".into()))
+            .is_err());
+        let backup = f.path.with_extension("backup");
+        fs::rename(&f.path, &backup).unwrap();
+        fs::create_dir(&f.path).unwrap();
+        assert!(f
+            .state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .is_err());
+        assert_eq!(f.state.snapshot().unwrap().areas, before);
+        fs::remove_dir(&f.path).unwrap();
+        fs::rename(backup, &f.path).unwrap();
+    }
+
+    #[test]
+    fn manager_only_consumes_results_for_the_selected_task() {
+        let f = Fixture::new();
+        for (request, code) in [
+            ("result-x", Some("B2C-X")),
+            ("result-y", Some("B2C-Y")),
+            ("general", None),
+        ] {
+            f.state
+                .enqueue_assignment(
+                    AssignAgentInput {
+                        terminal_id: f.manager.clone(),
+                        request_id: request.into(),
+                        message: "Resultado para conferir".into(),
+                        task_code: code.map(str::to_owned),
+                        step_ids: vec![],
+                        fresh_context: None,
+                        training: false,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let next = |state: &AppState| {
+            let p = guard(&state.persisted).unwrap();
+            let room = find_workspace(&p, &f.workspace).unwrap();
+            let manager = room.panel(&f.manager).unwrap().member.as_ref().unwrap();
+            manager.jobs[next_assignment_index(room, manager).unwrap()]
+                .id
+                .clone()
+        };
+        assert_eq!(next(&f.state), "general");
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-Y".into()))
+            .unwrap();
+        assert_eq!(next(&f.state), "result-y");
+        f.state
+            .prepare_manager_conversation(None, &f.manager, Some("B2C-X".into()))
+            .unwrap();
+        assert_eq!(next(&f.state), "result-x");
     }
 
     #[test]
@@ -3862,8 +4622,9 @@ pub fn answer_agent(
     terminal_id: String,
     request_id: Value,
     result: Value,
+    connection_id: String,
 ) -> Result<AppSnapshot, String> {
-    state.answer_agent(&terminal_id, request_id, result)
+    state.answer_agent(&terminal_id, request_id, result, &connection_id)
 }
 
 /// Explicit, isolated smoke journey. Never reads or replaces the user's workspace state.

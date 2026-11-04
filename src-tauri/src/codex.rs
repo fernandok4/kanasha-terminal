@@ -30,6 +30,34 @@ pub struct CodexSession {
 }
 
 impl CodexSession {
+    #[cfg(test)]
+    pub(crate) fn test_session(thread_id: &str) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(operation) = receiver.recv() {
+                match operation {
+                    Operation::Request(_, _, reply) => {
+                        let _ = reply.send(Ok(json!({})));
+                    }
+                    Operation::Stop => break,
+                    Operation::Response(_) => {}
+                }
+            }
+        });
+        let directory =
+            std::env::temp_dir().join(format!("kt-session-test-{}", crate::models::new_id()));
+        Self {
+            model: "test".into(),
+            reasoning_effort: "low".into(),
+            thread_id: thread_id.into(),
+            endpoint: String::new(),
+            connection_id: crate::models::new_id(),
+            sender,
+            child: Mutex::new(Command::new("sleep").arg("60").spawn().unwrap()),
+            directory,
+        }
+    }
+
     #[cfg(unix)]
     fn connect(
         root: &Path,
@@ -537,5 +565,80 @@ mod tests {
             panic!("manager terminal exited early: {}", output.lock().unwrap());
         }
         terminal.stop().unwrap();
+    }
+
+    #[test]
+    #[ignore = "uses installed Codex login; one isolated inference with sleep, no workspace files"]
+    fn installed_codex_turn_survives_remote_display_switch() {
+        let config = crate::execution::AgentExecution::preset("junior").unwrap();
+        let (events, receiver) = mpsc::channel();
+        let session = CodexSession::start(
+            Path::new("/tmp"), &config.cli_arguments(), &[], None,
+            "Isolated terminal lifecycle test. Only run the sleep command requested by the user. Do not read or write files, load skills, or call other tools.",
+            Some(&config), move |event| { let _ = events.send(event); },
+        ).unwrap();
+        let mut arguments = config.cli_arguments();
+        arguments.extend([
+            "--remote".into(),
+            session.endpoint.clone(),
+            "resume".into(),
+            session.thread_id.clone(),
+        ]);
+        let mut terminal =
+            crate::terminal::start_pty("codex", &arguments, &[], Path::new("/tmp"), |_| {}, || {})
+                .unwrap();
+        let started = session.request("turn/start", config.turn_params(&session.thread_id,
+            "Execute the shell command /bin/sleep 5, then respond exactly KANASHA_BACKGROUND_OK. No other commands or tools.")).unwrap();
+        let turn = started["turn"]["id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            assert_ne!(
+                event["method"], "turn/completed",
+                "Turn completed before the sleep command: {event}"
+            );
+            if event["method"] == "item/started"
+                && event["params"]["item"]["type"] == "commandExecution"
+            {
+                break;
+            }
+        }
+        // This is exactly what navigating away does to the display client.
+        // The independent structured connection and app server remain alive.
+        terminal.stop().unwrap();
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if event["method"] == "turn/completed" {
+                assert_eq!(event["params"]["turn"]["id"], turn);
+                assert_eq!(event["params"]["turn"]["status"], "completed", "{event}");
+                break;
+            }
+        }
+        let history = session
+            .request(
+                "thread/read",
+                json!({"threadId":session.thread_id,"includeTurns":true}),
+            )
+            .unwrap();
+        assert!(history["thread"]["turns"]
+            .to_string()
+            .contains("KANASHA_BACKGROUND_OK"));
+        let mut resumed_display =
+            crate::terminal::start_pty("codex", &arguments, &[], Path::new("/tmp"), |_| {}, || {})
+                .unwrap();
+        assert_eq!(
+            session
+                .request(
+                    "thread/read",
+                    json!({"threadId":session.thread_id,"includeTurns":true})
+                )
+                .unwrap()["thread"]["turns"],
+            history["thread"]["turns"]
+        );
+        resumed_display.stop().unwrap();
     }
 }

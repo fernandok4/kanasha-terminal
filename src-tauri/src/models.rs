@@ -182,9 +182,24 @@ pub struct TerminalPanel {
     pub member: Option<TeamMember>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerConversation {
+    pub thread_id: Option<String>,
+    pub instructions_hash: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamMember {
+    #[serde(default)]
+    pub manager_task_code: Option<String>,
+    #[serde(default)]
+    pub manager_conversations: HashMap<String, ManagerConversation>,
+    #[serde(default)]
+    pub deleted_manager_conversations: Vec<String>,
     #[serde(default)]
     pub execution: AgentExecution,
     #[serde(default)]
@@ -308,7 +323,15 @@ pub enum AssignmentStatus {
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConversationActivity {
+    pub working: bool,
+    pub waiting: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemberRuntime {
+    pub background_conversations: HashMap<String, ConversationActivity>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub training_memory_revision_before: Option<u64>,
@@ -377,7 +400,7 @@ impl TerminalPanel {
         let title = crate::learning::generated_name(&id, &[]);
         let personality = String::new();
         Self { id, title, label: None, profile_id: "codex".into(),
-            member: Some(TeamMember { execution: AgentExecution::manager(), professional_profile: None, automatic_name: true, personality, memory: AgentMemory::default(), soul: AgentSoul::default(), training: TrainingState::Awaiting, specialty: "Coordenação".into(), instructions: "Esclareça o objetivo com o usuário e coordene a equipe contratada. Distribua trabalho conforme as especialidades e consolide os resultados.".into(), manager: true, thread_id: None, session_instructions_hash: None, paused: false, jobs: Vec::new(), context_resets: Vec::new(), context_task_code: None, task_queue: Vec::new() }) }
+            member: Some(TeamMember { manager_task_code: None, manager_conversations: HashMap::new(), deleted_manager_conversations: Vec::new(), execution: AgentExecution::manager(), professional_profile: None, automatic_name: true, personality, memory: AgentMemory::default(), soul: AgentSoul::default(), training: TrainingState::Awaiting, specialty: "Coordenação".into(), instructions: "Esclareça o objetivo com o usuário e coordene a equipe contratada. Distribua trabalho conforme as especialidades e consolide os resultados.".into(), manager: true, thread_id: None, session_instructions_hash: None, paused: false, jobs: Vec::new(), context_resets: Vec::new(), context_task_code: None, task_queue: Vec::new() }) }
     }
 }
 
@@ -662,6 +685,9 @@ impl Workspace {
                 member.jobs.clear();
                 member.context_resets.clear();
                 member.context_task_code = None;
+                member.manager_task_code = None;
+                member.manager_conversations.clear();
+                member.deleted_manager_conversations.clear();
                 member.task_queue.clear();
                 member.paused = false;
             }

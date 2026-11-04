@@ -70,9 +70,13 @@ export interface TeamMember {
   paused: boolean;
   taskQueue?: string[];
   contextTaskCode?: string | null;
+  managerTaskCode?: string | null;
+  deletedManagerConversations?: string[];
+  managerConversations?: Record<string, { threadId: string | null; instructionsHash: string | null }>;
   jobs: Assignment[];
 }
 export interface MemberRuntime {
+  backgroundConversations?: Record<string, { working: boolean; waiting: boolean }>;
   model?: string | null;
   reasoningEffort?: string | null;
   instructionsRevision?: string | null;
@@ -83,6 +87,7 @@ export interface MemberRuntime {
   activity: string;
   updatedAt: number;
   request?: {
+    _connection?: string;
     id: number | string;
     method: string;
     params: { questions?: { id: string; header: string; question: string; options?: { label: string; description: string }[] }[]; command?: string; reason?: string };

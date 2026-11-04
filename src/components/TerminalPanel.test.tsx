@@ -106,6 +106,58 @@ describe("TerminalPanel", () => {
     expect(screen.queryByRole("button", { name: "Nova conversa com Ana" })).not.toBeInTheDocument();
   });
 
+  it("seleciona a conversa por task no dropdown à esquerda de encerrar", () => {
+    const onSelectTask = vi.fn(); const onCreateTask = vi.fn();
+    const panel = { id: "manager", title: "Ana", profileId: "codex", member: { manager: true, managerTaskCode: "B2C-X", managerConversations: { "B2C-Y": { threadId: "saved-y", instructionsHash: null } }, specialty: "Coordenação", instructions: "", paused: false, threadId: "saved-x", jobs: [] } };
+    const props = { panel, taskCodes: ["B2C-X"], onSelectTask, onCreateTask, active: true, focused: true, maximized: false, onStart: vi.fn(), onStop: vi.fn(), onClose: vi.fn(), onSplit: vi.fn(), onFocus: vi.fn(), onToggleMaximize: vi.fn(), onContextMenu: vi.fn() };
+    const { rerender } = render(<TerminalPanel {...props} />);
+    const dropdown = screen.getByRole("combobox", { name: "Conversa por tarefa de Ana" });
+    expect(dropdown.nextElementSibling).toBe(screen.getByRole("button", { name: "Encerrar Ana" }));
+    expect(dropdown).toHaveValue("B2C-X");
+    fireEvent.change(dropdown, { target: { value: "B2C-Y" } });
+    expect(onSelectTask).toHaveBeenCalledWith("manager", "B2C-Y");
+    fireEvent.change(dropdown, { target: { value: "" } });
+    expect(onSelectTask).toHaveBeenCalledWith("manager", null);
+    fireEvent.change(dropdown, { target: { value: "__new__" } });
+    expect(onCreateTask).toHaveBeenCalledWith("manager");
+    rerender(<TerminalPanel {...props} newConversationDisabled conversationActivity={{ "B2C-Y": { working: true, waiting: true } }} />);
+    expect(dropdown).toBeEnabled();
+    expect(screen.getByRole("option", { name: "B2C-Y · pergunta pendente" })).toBeInTheDocument();
+    fireEvent.change(dropdown, { target: { value: "__new__" } });
+    expect(onCreateTask).toHaveBeenCalledTimes(2);
+    rerender(<TerminalPanel {...props} panel={{ ...panel, member: { ...panel.member, jobs: [
+      { id: "result-y", taskCode: "B2C-Y", status: "queued", message: "Retorno de Y", result: "", createdAt: 1, updatedAt: 1, turnId: null, assignedBy: null },
+    ] } }} />);
+    expect(screen.getByRole("option", { name: "B2C-Y (1 pendentes)" })).toBeInTheDocument();
+    expect(dropdown).toHaveValue("B2C-X");
+    rerender(<TerminalPanel {...props} newConversationDisabled />);
+    expect(dropdown).toBeEnabled();
+    rerender(<TerminalPanel {...props} switchConversationDisabled />);
+    expect(dropdown).toBeDisabled();
+    rerender(<TerminalPanel {...props} panel={{ ...panel, member: { ...panel.member, manager: false } }} />);
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  });
+
+  it("mostra a lixeira e oculta chats excluídos sem esconder retornos pendentes", () => {
+    const onDeleteConversation = vi.fn();
+    const panel = { id: "manager", title: "Ana", profileId: "codex", member: { manager: true, managerTaskCode: "B2C-X", deletedManagerConversations: ["B2C-Y", "B2C-Z"], specialty: "Coordenação", instructions: "", paused: false, threadId: "saved-x", jobs: [
+      { id: "pending", taskCode: "B2C-Y", status: "queued" as const, message: "Retorno", result: "", createdAt: 1, updatedAt: 1, turnId: null, assignedBy: null },
+    ] } };
+    const props = { panel, taskCodes: ["B2C-X", "B2C-Y", "B2C-Z"], onDeleteConversation, onSelectTask: vi.fn(), active: true, focused: true, maximized: false, onStart: vi.fn(), onStop: vi.fn(), onClose: vi.fn(), onSplit: vi.fn(), onFocus: vi.fn(), onToggleMaximize: vi.fn(), onContextMenu: vi.fn() };
+    const { rerender } = render(<TerminalPanel {...props} />);
+    const button = screen.getByRole("button", { name: "Excluir conversa B2C-X" });
+    expect(screen.getByRole("combobox").nextElementSibling).toBe(button);
+    expect(button.nextElementSibling).toBe(screen.getByRole("button", { name: "Encerrar Ana" }));
+    expect(screen.queryByRole("option", { name: "B2C-Z" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "B2C-Y (1 pendentes)" })).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(onDeleteConversation).toHaveBeenCalledWith("manager");
+    rerender(<TerminalPanel {...props} newConversationDisabled />);
+    expect(button).toBeDisabled();
+    rerender(<TerminalPanel {...props} panel={{ ...panel, member: { ...panel.member, manager: false } }} />);
+    expect(screen.queryByRole("button", { name: "Excluir conversa B2C-X" })).not.toBeInTheDocument();
+  });
+
   it("descarta a tela anterior ao reconectar a conversa da mesma pessoa", async () => {
     render(<TerminalPanel panel={{ id: "member", title: "Lia", profileId: "codex" }} active focused maximized={false} onStart={vi.fn()} onStop={vi.fn()} onClose={vi.fn()} onSplit={vi.fn()} onFocus={vi.fn()} onToggleMaximize={vi.fn()} onContextMenu={vi.fn()} />);
     await waitFor(() => expect(mocks.resetListener).toBeDefined());

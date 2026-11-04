@@ -27,8 +27,14 @@ type TerminalPanelProps = {
   maximized: boolean;
   onStart: (terminalId: string) => void;
   onStop: (terminalId: string) => void;
+  taskCodes?: string[];
+  onSelectTask?: (terminalId: string, taskCode: string | null) => void;
+  onCreateTask?: (terminalId: string) => void;
+  onDeleteConversation?: (terminalId: string) => void;
   onNewConversation?: (terminalId: string) => void;
   newConversationDisabled?: boolean;
+  switchConversationDisabled?: boolean;
+  conversationActivity?: Record<string, { working: boolean; waiting: boolean }>;
   onClose: (terminalId: string) => void;
   onSplit: (terminalId: string, direction: "horizontal" | "vertical") => void;
   onFocus: (terminalId: string) => void;
@@ -45,8 +51,14 @@ export function TerminalPanel({
   maximized,
   onStart,
   onStop,
+  taskCodes = [],
+  onSelectTask,
+  onCreateTask,
+  onDeleteConversation,
   onNewConversation,
   newConversationDisabled = false,
+  switchConversationDisabled = false,
+  conversationActivity = {},
   onClose,
   onSplit,
   onFocus,
@@ -217,6 +229,25 @@ export function TerminalPanel({
         <span className="terminal-profile">{panel.profileId}</span>
         <span className="terminal-state" role="status">{agentStatusLabel}</span>
         <div className="terminal-actions">
+          {panel.member?.manager && onSelectTask ? <select
+            className="manager-task-select"
+            aria-label={`Conversa por tarefa de ${panel.title}`}
+            title="Selecione a tarefa para retomar sua conversa"
+            value={panel.member.managerTaskCode ?? ""}
+            disabled={switchConversationDisabled}
+            onChange={event => event.target.value === "__new__" ? onCreateTask?.(panel.id) : onSelectTask(panel.id, event.target.value || null)}
+          >{["", ...new Set([...taskCodes, ...Object.keys(conversationActivity).filter(Boolean), ...Object.keys(panel.member.managerConversations ?? {}).filter(Boolean), ...panel.member.jobs.flatMap(job => job.taskCode ? [job.taskCode] : []), ...(panel.member.managerTaskCode ? [panel.member.managerTaskCode] : [])])].filter(code => !panel.member!.deletedManagerConversations?.includes(code) || code === panel.member!.managerTaskCode || panel.member!.jobs.some(job => job.taskCode === code && job.status === "queued")).map(code => {
+            const pending = panel.member!.jobs.filter(job => job.status === "queued" && (job.taskCode ?? "") === code).length;
+            return <option key={code} value={code}>{code || "Geral"}{conversationActivity[code]?.waiting ? " · pergunta pendente" : conversationActivity[code]?.working ? " · em andamento" : ""}{pending ? ` (${pending} pendentes)` : ""}</option>;
+          })}{onCreateTask ? <option value="__new__">+ Outra task…</option> : null}</select> : null}
+          {panel.member?.manager && onDeleteConversation ? <button
+            title="Excluir conversa selecionada"
+            aria-label={`Excluir conversa ${panel.member.managerTaskCode ?? "Geral"}`}
+            disabled={newConversationDisabled}
+            onClick={() => onDeleteConversation(panel.id)}
+          ><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+            <path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" />
+          </svg></button> : null}
           {active ? (
             <button title="Encerrar processo" aria-label={`Encerrar ${panel.title}`} onClick={() => onStop(panel.id)}>
               ■

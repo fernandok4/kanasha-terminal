@@ -177,6 +177,18 @@ it("repete o recibo de envio quando a resposta falha, para não duplicar trabalh
   expect(invoke.mock.calls[1][1]).toEqual(first);
 });
 
+it.each([false, true])("envia a mensagem do gerente para a conversa selecionada (treinamento=%s)", async training => {
+  const room = structuredClone(workspace);
+  room.panels[0].member!.managerTaskCode = "B2C-X";
+  render(<TeamView workspace={room} snapshot={snapshot} onSnapshot={vi.fn()} onOpen={vi.fn()} />);
+  if (training) fireEvent.click(screen.getByLabelText("Treinamento complementar (exige nova revisão)"));
+  fireEvent.change(screen.getByLabelText(training ? "Treinamento de Marina" : "O que você quer realizar?"), { target: { value: "Conferir os critérios" } });
+  fireEvent.click(screen.getByRole("button", { name: training ? "Enviar treinamento" : "Enviar atribuição" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("assign_agent", {
+    input: expect.objectContaining({ terminalId: "manager", taskCode: "B2C-X", training, message: "Conferir os critérios" }),
+  }));
+});
+
 
 it("enfileira um step com código Jira enquanto a pessoa trabalha, sem permitir reset manual", async () => {
   render(<TeamView workspace={workspace} snapshot={snapshot} onSnapshot={vi.fn()} onOpen={vi.fn()} />);
